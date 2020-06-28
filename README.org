@@ -1,0 +1,2151 @@
+#+TITLE: GerbilGSF: Compound File Binary Format
+
+Essentially, my clients use a lot of Microsoft, whereas I stopped using their
+products in '96. So, to display them, manipulate them, or even know what they
+are, a lexical structuring library is a nice thing to have.
+
+
+* Installation
+
+** Make sure you have the dynamic library installed
+
+   I use ~Nix~ to install things that are the same across servers and dists.
+
+ #+begin_src shell
+
+   nix search -u gsf
+   # * nixpkgs.libgsf (libgsf)
+   # GNOME's Structured File Library
+   nix-env -iA nixpkgs.libgsf nixpkgs.pkgconfig
+
+ #+end_src
+
+We need to use ~pkg-config~ in order to tell us where things lie. Apparently
+that's the way to do it these days.
+
+ #+begin_src shell :session build
+   export PKG_CONFIG_PATH=$(nix-shell -p libgsf pkgconfig mount libselinux libsepol \
+                              --run 'echo $PKG_CONFIG_PATH')
+   # >
+   pkg-config --list-all |grep gsf
+   # =>
+   # libgsf-1  libgsf-1 - A library for reading and writing structured files (eg MS OLE and Zip)
+
+   # >
+   pkg-config --cflags --libs libgsf-1
+   #-I/nix/store/xj47h03pfszv8nnl0alq5sxld8yjsjyb-libgsf-1.14.46-dev/include/libgsf-1 -I/nix/store/3kg0ihc8k0y7nh3r90hvdsn69k82w4pa-libxml2-2.9.9-dev/include/libxml2 -I/nix/store/fnyy7kwhg8bwxvi2xpjz7vndlz3a1a02-glib-2.62.2-dev/include -I/nix/store/fnyy7kwhg8bwxvi2xpjz7vndlz3a1a02-glib-2.62.2-dev/include/glib-2.0 -I/nix/store/r1qdhsvij69811ysvr0d4ijp1hc9bi94-glib-2.62.2/lib/glib-2.0/include -L/nix/store/82ir1iysw4havqhdpwnxikhmbwkj7g9a-libgsf-1.14.46/lib -L/nix/store/czkcspqabj4b4id26s0xbvd49lhc8l36-libxml2-2.9.9/lib -L/nix/store/r1qdhsvij69811ysvr0d4ijp1hc9bi94-glib-2.62.2/lib -lgsf-1 -lgobject-2.0 -lglib-2.0 -lxml2
+
+ #+end_src
+ 
+
+ #+begin_src shell :session build :results output
+ comp () {
+ gxc  -cc-options "`pkg-config --cflags libgsf-1`"\
+      -ld-options "`pkg-config --libs libgsf-1`"\
+   $1
+  true;
+ }
+
+   comp glib.ss
+   true
+ #+end_src
+
+ #+RESULTS:
+
+ 
+* ~glib.h~ and ~GObject~: The GLib Object System
+
+
+** ~define-c-GType~: A prelude macro
+   :PROPERTIES:
+   :CUSTOM_ID: define_c_gstruct
+   :END:
+
+We want a short form to have a type that does not have a release-function by default.
+
+  - define-c-GType :: (name (tags '()) (free #f))
+
+#+begin_src gerbil :noweb-ref define-c-GType
+  (define-macro (define-c-GType name . tags/free)
+    (let* ((str (symbol->string name))
+           (ptr (string->symbol (string-append str "*")))
+           (ptr-tags (cond ((and (pair? tags/free) (list? (car tags/free)))
+                            (cons ptr (car tags/free)))
+                           ((and (pair? tags/free) (eq? #f (car tags/free)))
+                            #f)
+                           (else (list ptr))))
+           (ptr-free (if (and (pair? tags/free)
+                            (string? (last tags/free)))
+                       (list (last tags/free))
+                       '())))
+    `(begin (c-define-type ,name ,str)
+            (c-define-type ,ptr (pointer ,str ,ptr-tags ,@ptr-free)))))
+#+end_src
+
+** ~gobj_free~: Our own ~g_object_unref~
+
+ First things first, we'll make a function for the gerbil GC that frees the
+ object when done. It will actually come last.
+
+ #+begin_src c :noweb-ref gobj_free
+ #ifndef ___HAVE_GOBJ_FREE
+ #define ___HAVE_GOBJ_FREE
+ ___SCMOBJ gobj_free (void *ptr)
+ {
+  g_object_unref (ptr);
+  return ___FIX (___NO_ERR);
+ }
+ #endif
+ #+end_src
+
+** ~define-c-GObject~: A prelude macro
+   :PROPERTIES:
+   :CUSTOM_ID: define_c_gobject
+   :END:
+
+
+Now that we have ~gobj_free~ we can make a way to easily define a gerbil
+interface to it.
+
+#+begin_src gerbil :noweb-ref define-c-GObject
+   (define-macro (define-c-GObject name . tags)
+     (let* ((str (symbol->string name))
+            (ptr (string->symbol (string-append str "*")))
+            (ptr-tags (cond ((and (pair? tags) (list? (car tags)))
+                             (cons ptr (car tags)))
+                            ((and (pair? tags) (eq? #f (car tags)))
+                             #f)
+                            (else (list ptr)))))
+
+
+     `(begin (c-define-type ,name ,str)
+             (c-define-type ,ptr (pointer ,str ,ptr-tags "gobj_free")))))
+#+end_src
+
+** /File/ ~glib.ss~
+
+ #+begin_src gerbil :tangle glib.ss :noweb yes
+   (import :std/foreign (for-syntax :std/stxutil))
+   (export begin-glib-ffi)
+   (defsyntax (begin-glib-ffi stx)
+     (def (prelude-macros)
+       '(
+         <<define-c-GType>>
+         <<define-c-GObject>>
+         ))
+     (syntax-case stx ()
+       ((_ exports body ...)
+        (with-syntax (((macros ...) (prelude-macros)))
+          #'(begin-ffi
+             exports
+             macros ...
+             (c-declare "___SCMOBJ gobj_free(void *ptr);")
+             (c-declare "#include <glib.h>")
+             (define-c-GObject GObject #f)
+             (define-const TRUE)
+             (define-const FALSE)
+            body ...
+            (c-declare #<<END-C
+   <<gobj_free>>
+   END-C
+   ))))))
+ #+end_src
+
+
+
+* Act 1: Read an Outlook ~.msg~ file
+
+  The entire reason for this was to read those files. To start with, one of the
+  tests for ~GSF~ is to export a ~msole~ file to a directory tree. Having a
+  ~.msg~ file in a directory will help and it's a wonderful first step for FFI,
+  so here we go.
+
+
+** Introduction: The structure of a Message object in the .msg File Format
+
+#+begin_src shell :session build :results output
+gcc `pkg-config --cflags --libs libgsf-1` -o test-dump-msole test/test-dump-msole.c 2> /dev/null
+./test-dump-msole test/Outlook1.msg test/dump/
+#+end_src
+ That worked well! But, WTF is it?
+
+
+ #+begin_quote
+ The .msg File Format is based on the Compound File Binary File Format, which is
+ described in [fn:MS-CFB]. The paradigm provides for the concept of storages and
+ streams, which are similar to directories and files, except that the entire
+ hierarchy of storages and streams are packaged into a single file, called a
+ compound file. This facility allows applications to store complex, structured
+ data in a single file. For more information regarding structured storage in a
+ compound file, see [MSDN-STS]"
+
+ #+end_quote
+
+Ok, that helps. The files and directories are streams and storages. What do they
+mean?
+
+ #+begin_src shell :results output list
+ ls ./test/dump/
+ #+end_src
+
+ #+begin_example
+ - __attach_version1.0_#00000000
+ - __nameid_version1.0
+ - __properties_version1.0
+ - __recip_version1.0_#00000000
+ - __recip_version1.0_#00000001
+ - __recip_version1.0_#00000002
+ - __recip_version1.0_#00000003
+ - __substg1.0_001A001F
+ - __substg1.0_002C0102
+ - __substg1.0_0037001F
+ - __substg1.0_003B0102
+ - __substg1.0_003D001F
+ - __substg1.0_003F0102
+ - __substg1.0_0040001F
+ - __substg1.0_00410102
+ - __substg1.0_0042001F
+ - __substg1.0_00430102
+ - __substg1.0_0044001F
+ - __substg1.0_00510102
+ - __substg1.0_00520102
+ - __substg1.0_0064001F
+ - __substg1.0_0065001F
+ - __substg1.0_0070001F
+ - __substg1.0_00710102
+ - __substg1.0_0075001F
+ - __substg1.0_0076001F
+ - __substg1.0_0077001F
+ - __substg1.0_0078001F
+ - __substg1.0_007D001F
+ - __substg1.0_0C190102
+ - __substg1.0_0C1A001F
+ - __substg1.0_0C1D0102
+ - __substg1.0_0C1E001F
+ - __substg1.0_0C1F001F
+ - __substg1.0_0E02001F
+ - __substg1.0_0E03001F
+ - __substg1.0_0E04001F
+ - __substg1.0_0E05001F
+ - __substg1.0_0E1D001F
+ - __substg1.0_0F030102
+ - __substg1.0_1000001F
+ - __substg1.0_10090102
+ - __substg1.0_1015001F
+ - __substg1.0_1035001F
+ - __substg1.0_1039001F
+ - __substg1.0_1042001F
+ - __substg1.0_300B0102
+ - __substg1.0_30140102
+ - __substg1.0_3FFA001F
+ - __substg1.0_3FFB0102
+ - __substg1.0_4022001F
+ - __substg1.0_4023001F
+ - __substg1.0_4024001F
+ - __substg1.0_4025001F
+ - __substg1.0_4030001F
+ - __substg1.0_4031001F
+ - __substg1.0_4034001F
+ - __substg1.0_4035001F
+ - __substg1.0_4038001F
+ - __substg1.0_4039001F
+ - __substg1.0_5D01001F
+ - __substg1.0_5D02001F
+ - __substg1.0_5D07001F
+ - __substg1.0_5D08001F
+ - __substg1.0_5D0A001F
+ - __substg1.0_5D0B001F
+ - __substg1.0_65E20102
+ - __substg1.0_65E30102
+ - __substg1.0_8005001F
+ - __substg1.0_8006001F
+ - __substg1.0_8007001F
+ - __substg1.0_8008001F
+ - __substg1.0_8009001F
+ - __substg1.0_800A001F
+ - __substg1.0_800C0102
+ - __substg1.0_800F0048
+ - __substg1.0_80100102
+ - __substg1.0_8011001F
+ - __substg1.0_8012001F
+ - __substg1.0_8013001F
+ - __substg1.0_8016001F
+ - __substg1.0_8018001F
+ - __substg1.0_8019001F
+ - __substg1.0_801A001F
+ - __substg1.0_801B001F
+ #+end_example
+
+** Scene 1: Find the ~Subject:~ header
+
+   As much as I love reading documentation, I find code to be a better guide.
+   Mixing the two in a literate fashion is even better, but I digress.
+
+   I find the [[#msg_reader_js][~msg.reader.js~]] code fairly easy to browse and it has this.
+
+#+begin_src javascript
+  FIELD: {
+    PREFIX: {
+      ATTACHMENT: '__attach_version1.0',
+      RECIPIENT: '__recip_version1.0',
+      DOCUMENT: '__substg1.'
+    },
+    NAME_MAPPING: {
+      // email specific
+      '0037': 'subject'
+      // [...]
+    }
+  }
+#+end_src
+
+Cool! So anything child stream whose name starts with ~__substg1.~ is a
+~DOCUMENT~? That ~NAME_MAPPING~ also hints towards what I need to know.
+
+If I search the files for that number I get :
+
+ - __substg1.0_0037001F
+
+Ok, what does ~0_~ mean, and ~001F~?
+
+ #+begin_quote
+ 	The name of that stream is determined by the property's property tag. The
+ 	stream name is created by prefixing a string containing the hexadecimal
+ 	representation of the property tag with the string "__substg1.0_". For
+ 	example, if the property is PidTagScheduleInfoMonthsBusy ([fn:MS-OXPROPS] section
+ 	2.976), the name of the stream is "__substg1.0_68531003", where "68531003" is
+ 	the hexadecimal representation of the property tag for
+ 	PidTagScheduleInfoMonthsBusy.[fn:MS-OXMSG]
+#+end_quote
+
+Elsewhere it says "a substorage with the name "__substg1.0_3701000D" MUST be
+created.", which helps the ol' noggin process things. ~__substg1.0_~ means a
+*substorage*. The rest is a property tag.
+
+Searching for ~001F~ in *MS-OXMSG* gives me 'if the property is PidTagSubject
+([fn:MS-OXPROPS] section 2.1027), the name of the stream is
+"__substg1.0_0037001F", where "0037001F" is the hexadecimal representation of
+the property tag for PidTagSubject'.
+
+Fsck'n A! The code and the docs start to unite. Looking at *MS-OXPROPS* we get a
+nice description.
+
+
+ - Canonical name :: PidTagSubject
+
+ - Description :: Contains the subject of the email message.
+
+ - Property ID :: 0x0037
+
+ - Data type :: PtypString, 0x001F
+
+ - Area :: General Message Properties
+
+ - Defining reference :: *MS-OXCMSG*[fn:MS-OXCMSG] section 2.2.1.46
+
+
+This feels good. In the defining reference it gives more details
+
+#+begin_quote
+Type: PtypString (*MS-OXCDATA*[fn:MS-OXCDATA] section 2.11.1)
+
+The PidTagSubject property ([fn:MS-OXPROPS] section 2.1033) contains the full
+subject of an e-mail message. The full subject is a concatenation of the subject
+prefix, as identified by the PidTagSubjectPrefix property (section 2.2.1.9), and
+the normalized subject, as identified by the PidTagNormalizedSubject property
+(section 2.2.1.10). If the PidTagSubjectPrefix property is not set or is set to
+an empty string, then the values of the PidTagSubject and
+PidTagNormalizedSubject properties are equal.
+#+end_quote
+
+Ok ok ok, I'll byte. What is a *PtypString*? 
+
+#+begin_quote
+PtypString 0x001F, %x1F.00
+
+Variable size; a string of Unicode characters in UTF-16LE format encoding with
+terminating null character (0x0000).
+
+PT_UNICODE, string
+#+end_quote
+
+It's a C-string in a certain encoding. We can handle that with a
+UTF-16-string[fn:gambc-types] I think. Apparently there's a Byte Order
+Mark(*BOM*)[fn:rfc-2781] that lets us know.
+
+I like code. Searching through the git for ~libgsf~[fn:gsf-git] I came across [[*/File
+ ~gsf.c~][~gsf.c~]].
+
+It's "a simple archive utility, somewhat similar to tar. It operates on files
+following one of the structured file formats understood by the G Structured File
+library".
+
+Awesome, so, wait? can that give me the subject?
+
+#+begin_src shell :results code
+sh -c 'gsf cat test/Outlook1.msg __substg1.0_0037001F' 
+#+end_src
+
+#+RESULTS:
+#+begin_src shell
+[EXT] Re: [EXT] Re: Outlook .msg files
+#+end_src
+
+Ok, this is where it gets fun. When I do so in my terminal emulator, I get a string.
+
+#+begin_src shell
+$ gsf cat test/Outlook1.msg __substg1.0_0037001F
+[EXT] Re: [EXT] Re: Outlook .msg files
+#+end_src
+
+But when I try it in this buffer,  get some weirdness.
+
+#+begin_src shell
+[ E X T ]   R e :   [ E X T ]   R e :   O u t l o o k   . m s g   f i l e s 
+#+end_src
+
+Ah, wait!! encodings.
+
+#+begin_src shell
+gsf cat test/Outlook1.msg __substg1.0_0037001F | iconv --from UTF-16 --to UTF-8 -
+#+end_src
+
+: [EXT] Re: [EXT] Re: Outlook .msg files
+
+YAY!! We've now got the code and the knowledge to get it from gerbil. Let's go!
+
+** Scene 2: Gerbil-ize it!
+
+   Here's what I think we need.
+
+   1) Read the file
+   2) Find the child named ~__substg1.0_0037001~
+   3) Output the value as a string
+
+
+*** Read the file.
+
+    Again, code! ~gsf.c~ has ~open_archive~ which does what we want.
+
+    It has a type to declare. 
+
+#+begin_src c :noweb-ref open_archive_c
+static GsfInfile *
+open_archive (char const *filename)
+{
+  GsfInfile *infile;
+  GError *error = NULL;
+  GsfInput *src;
+  char *display_name;
+
+  src = gsf_input_stdio_new (filename, &error);
+  if (error) {
+    display_name = g_filename_display_name (filename);
+    g_printerr (_("%s: Failed to open %s: %s\n"),
+          g_get_prgname (),
+          display_name,
+          error->message);
+    g_free (display_name);
+    return NULL;
+  }
+
+  infile = gsf_infile_zip_new (src, NULL);
+  if (infile) {
+    g_object_unref (src);
+    return infile;
+  }
+
+  infile = gsf_infile_msole_new (src, NULL);
+  if (infile) {
+    g_object_unref (src);
+    return infile;
+  }
+
+  infile = gsf_infile_tar_new (src, NULL);
+  if (infile) {
+    g_object_unref (src);
+    return infile;
+  }
+
+  display_name = g_filename_display_name (filename);
+  g_printerr (_("%s: Failed to recognize %s as an archive\n"),
+        g_get_prgname (),
+        display_name);
+  g_free (display_name);
+
+  g_object_unref (src);
+  return NULL;
+}
+#+end_src
+
+Here's the hierarchy from *Infile reading structed files*[fn:gfs-infile].
+
+Object Hierarchy
+    GObject
+    ╰── GsfInput
+        ╰── GsfInfile
+            ├── GsfInfileMSOle
+            ├── GsfInfileStdio
+            ├── GsfInfileTar
+            ├── GsfInfileZip
+            ╰── GsfStructuredBlob
+
+We can use that and a ~c-lambda()~[fn:gambc-c-lambda].
+
+#+begin_src gerbil :noweb-ref open-archive-objects
+    (define-c-GObject GsfInput (GsfInfile))
+    (define-c-GObject GsfInfile)
+#+end_src
+
+#+begin_src gerbil :noweb-ref open-archive
+ (define open-archive (c-lambda (char-string) GsfInfile* "open_archive"))
+#+end_src
+
+That with some includes give as a [[#file_open_archive_ss][file]], which we compile.
+
+
+ #+begin_src shell :sh :session (if (get-buffer "build") (if (kill-buffer "build") (print "build") (print "build"))(print "build")) :results output
+   export PKG_CONFIG_PATH=$(nix-shell -p libgsf pkgconfig mount libselinux libsepol \
+                              --run 'echo $PKG_CONFIG_PATH')
+   gxc -cc-options "`pkg-config --cflags libgsf-1`" -ld-options "`pkg-config --libs libgsf-1`" test/open-archive.ss
+ #+end_src
+
+Now we can read the file.
+
+#+begin_src gerbil
+  (import :drewc/gsf/test/open-archive)
+
+  (open-archive "/home/user/src/gerbil-gsf/test/Outlook1.msg")
+  ;; => #<GsfInfile* #133 0xf922b0>
+#+end_src
+
+*** Find the child
+
+    ~gsf.c~ has ~find_member~ which is also exactly what we want.
+
+#+begin_src c :noweb-ref find_member_c
+static GsfInput *
+find_member (GsfInfile *arch, char const *name)
+{
+  char const *slash = strchr (name, '/');
+
+  if (slash) {
+    char *dirname = g_strndup (name, slash - name);
+    GsfInput *member;
+    GsfInfile *dir;
+
+    member = gsf_infile_child_by_name (arch, dirname);
+    g_free (dirname);
+    if (!member)
+      return NULL;
+    dir = GSF_INFILE (member);
+    member = find_member (dir, slash + 1);
+    g_object_unref (dir);
+    return member;
+  } else {
+    return gsf_infile_child_by_name (arch, name);
+  }
+}
+#+end_src
+
+#+begin_src gerbil :noweb-ref find-member
+ (define find-member (c-lambda (GsfInfile* char-string) GsfInput* "find_member"))
+#+end_src
+
+*** Output the value as a string
+
+    In ~gsf.c~ there's ~gsf_dump~, which is not quite what we want but leads us
+    to a place that does. In [[#file_test_dump_msole_c][~test-dump-msole.c~]] there's a ~_clone~ function
+    which leads us to ~gsf_input_read()~[fn:gfs_input_read].
+
+    We'll make a function in C which returns a pointer to a string.
+
+#+begin_src c :noweb-ref __GsfInput_to_string
+    static char *
+      __GsfInput_to_string (GsfInput *input)
+      {
+        guint8 const *data;
+        size_t len;
+        GString *str;
+
+       len = gsf_input_size (input);
+
+        if (NULL == (data = gsf_input_read (input, len, NULL))) {
+          g_warning ("error reading ?");
+          return;
+        }
+
+        str = g_string_new_len (data, len);
+
+        g_object_unref (G_OBJECT (input));
+
+        return g_string_free(str, FALSE);
+      }
+#+end_src
+
+
+#+begin_src gerbil :noweb-ref input-to-string
+  (define input->string (c-lambda (GsfInput*) UTF-16-string "__GsfInput_to_string"))
+#+end_src
+
+
+*** /File/ ~input-to-string.ss~
+    :PROPERTIES:
+    :CUSTOM_ID: file_find_member_ss
+    :END:
+
+#+begin_src gerbil :noweb yes :tangle test/input-to-string.ss
+  (import (for-syntax :drewc/gsf/glib) :std/foreign :drewc/gsf/glib)
+  (export input->string)
+
+  (begin-glib-ffi (input->string)
+
+    (c-declare #<<END-C
+
+
+  #include <gsf/gsf.h>
+  #include <glib/gi18n.h>
+  #include <glib/gstdio.h>
+  #include <gio/gio.h>
+  #include <locale.h>
+  #include <string.h>
+  #include <errno.h>
+
+  <<__GsfInput_to_string>>
+  END-C
+  )
+  <<open-archive-objects>>
+  <<input-to-string>>)
+#+end_src
+
+
+
+ #+begin_src shell :results output
+   export PKG_CONFIG_PATH=$(nix-shell -p libgsf pkgconfig mount libselinux libsepol \
+                                      --run 'echo $PKG_CONFIG_PATH')
+   gxc  -cc-options "`pkg-config --cflags libgsf-1`"\
+        -ld-options "`pkg-config --libs libgsf-1`"\
+        test/input-to-string.ss
+
+   true;
+ #+end_src
+
+ #+RESULTS:
+
+And test it.
+
+#+begin_src gerbil
+  (import :drewc/gsf/test/input-to-string :drewc/gsf/test/find-member :drewc/gsf/test/open-archive)
+
+  (input->string
+   (find-member (open-archive "/home/user/src/gerbil-gsf/test/Outlook1.msg")
+               "__substg1.0_0037001F"))
+  ;; => #<GsfInput* #135 0xf92230>
+#+end_src
+
+
+
+
+*** /File/ ~find-member.ss~
+    :PROPERTIES:
+    :CUSTOM_ID: file_find_member_ss
+    :END:
+
+#+begin_src gerbil :noweb yes :tangle test/find-member.ss
+  (import (for-syntax :drewc/gsf/glib) :std/foreign :drewc/gsf/glib)
+  (export find-member)
+
+  (begin-glib-ffi (find-member)
+
+    (c-declare #<<END-C
+
+
+  #include <gsf/gsf.h>
+  #include <glib/gi18n.h>
+  #include <glib/gstdio.h>
+  #include <gio/gio.h>
+  #include <locale.h>
+  #include <string.h>
+  #include <errno.h>
+
+  <<find_member_c>>
+  END-C
+  )
+  <<open-archive-objects>>
+  <<find-member>>)
+#+end_src
+
+
+
+ #+begin_src shell :results output
+   export PKG_CONFIG_PATH=$(nix-shell -p libgsf pkgconfig mount libselinux libsepol \
+                              --run 'echo $PKG_CONFIG_PATH')
+ gxc  -cc-options "`pkg-config --cflags libgsf-1`"\
+      -ld-options "`pkg-config --libs libgsf-1`"\
+  test/find-member.ss
+ #+end_src
+
+ #+RESULTS:
+
+And test it.
+
+#+begin_src gerbil
+  (import :drewc/gsf/test/find-member :drewc/gsf/test/open-archive)
+
+  (find-member (open-archive "/home/user/src/gerbil-gsf/test/Outlook1.msg")
+               "__substg1.0_0037001F")
+  ;; => #<GsfInput* #135 0xf92230>
+#+end_src
+
+
+
+
+*** /File/ ~open-archive.ss~
+    :PROPERTIES:
+    :CUSTOM_ID: file_open_archive_ss
+    :END:
+
+#+begin_src gerbil :noweb yes :tangle test/open-archive.ss
+  (import (for-syntax :drewc/gsf/glib) :std/foreign :drewc/gsf/glib)
+  (export open-archive)
+
+  (begin-glib-ffi (open-archive)
+
+    (c-declare #<<END-C
+
+
+  #include <gsf/gsf.h>
+  #include <glib/gi18n.h>
+  #include <glib/gstdio.h>
+  #include <gio/gio.h>
+  #include <locale.h>
+  #include <string.h>
+  #include <errno.h>
+
+  <<open_archive_c>>
+  END-C
+  )
+  <<open-archive-objects>>
+  <<open-archive>>)
+#+end_src
+
+
+
+ #+begin_src shell :session build
+ gxc  -cc-options "`pkg-config --cflags libgsf-1`"\
+      -ld-options "`pkg-config --libs libgsf-1`"\
+  test/open-archive.ss
+ #+end_src
+
+ #+RESULTS:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+** Scene 3:  
+** ~man gsf~
+
+#+begin_src shell :results output 
+man gsf
+#+end_src
+
+#+begin_example
+GSF(1)                               GNOME                              GSF(1)
+
+NAME
+       gsf - archiving utility using the G Structured File library
+
+SYNOPSIS
+       gsf [OPTION...] SUBCOMMAND ARCHIVE...
+
+DESCRIPTION
+       This manual page briefly documents the gsf command.
+
+       gsf  is  a simple archive utility, somewhat similar to tar(1). It oper‐
+       ates on files following one of the structured file  formats  understood
+       by  the  G  Structured  File  library, for example, Microsoft Excel(TM)
+       files.
+
+OPTIONS
+   Options
+       -?, --help
+              Show help options
+
+       -v, --version
+              Display gsf's version
+
+   Subcommands
+       cat    Output one or more files in archive
+
+       dump   Dump one or more files in archive as formatted hexadecimal
+
+       help   List subcommands
+
+       list   List files in archive
+
+       props  Archive list of property names
+
+EXAMPLES
+       To list the content structure of a Microsoft Excel(TM) file arrays.xls:
+
+       gsf list arrays.xls
+
+       To dump Workbook, an individual data stream in arrays.xls:
+
+       gsf dump arrays.xls Workbook
+
+AUTHORS
+       gsf's primary authors are Morten Welinder  <terra@gnome.org>  and  Jody
+       Goldberg <jody@gnome.org>.
+
+       The  initial version of this manpage was written by J.H.M. Dassen (Ray)
+       <jdassen@debian.org>.
+
+SEE ALSO
+       gnumeric(1)
+
+       The Gnumeric homepage ⟨http://www.gnome.org/projects/gnumeric/⟩
+
+       The GNOME project page ⟨http://www.gnome.org/⟩
+
+gsf                            29 November 2009                         GSF(1)
+#+end_example
+
+** /File ~gsf.c~
+   :PROPERTIES:
+   :CUSTOM_ID: gsf_c
+   :END:
+
+#+begin_src c
+
+  /* vim: set sw=8: -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
+
+  #include <gsf-config.h>
+  #include <gsf/gsf.h>
+  #include <glib/gi18n.h>
+  #include <glib/gstdio.h>
+  #include <gio/gio.h>
+  #include <locale.h>
+  #include <string.h>
+  #include <errno.h>
+
+  static gboolean show_version;
+  static int opt_zip64 = -1;
+
+  static GOptionEntry const gsf_options [] = {
+    {
+      "version", 'v',
+      0, G_OPTION_ARG_NONE, &show_version,
+      N_("Display program version"),
+      NULL
+    },
+
+    /* All options below are for gsf testing only.  */
+    {
+      "zip64", 0,
+      G_OPTION_FLAG_HIDDEN, G_OPTION_ARG_INT, &opt_zip64,
+      "",
+      NULL
+    },
+
+    /* ---------------------------------------- */
+
+    { NULL, 0, 0, 0, NULL, NULL, NULL}
+  };
+
+  /* ------------------------------------------------------------------------- */
+
+  static GsfInfile *
+  open_archive (char const *filename)
+  {
+    GsfInfile *infile;
+    GError *error = NULL;
+    GsfInput *src;
+    char *display_name;
+
+    src = gsf_input_stdio_new (filename, &error);
+    if (error) {
+      display_name = g_filename_display_name (filename);
+      g_printerr (_("%s: Failed to open %s: %s\n"),
+            g_get_prgname (),
+            display_name,
+            error->message);
+      g_free (display_name);
+      return NULL;
+    }
+
+    infile = gsf_infile_zip_new (src, NULL);
+    if (infile) {
+      g_object_unref (src);
+      return infile;
+    }
+
+    infile = gsf_infile_msole_new (src, NULL);
+    if (infile) {
+      g_object_unref (src);
+      return infile;
+    }
+
+    infile = gsf_infile_tar_new (src, NULL);
+    if (infile) {
+      g_object_unref (src);
+      return infile;
+    }
+
+    display_name = g_filename_display_name (filename);
+    g_printerr (_("%s: Failed to recognize %s as an archive\n"),
+          g_get_prgname (),
+          display_name);
+    g_free (display_name);
+
+    g_object_unref (src);
+    return NULL;
+  }
+
+  /* ------------------------------------------------------------------------- */
+
+  static GsfInput *
+  find_member (GsfInfile *arch, char const *name)
+  {
+    char const *slash = strchr (name, '/');
+
+    if (slash) {
+      char *dirname = g_strndup (name, slash - name);
+      GsfInput *member;
+      GsfInfile *dir;
+
+      member = gsf_infile_child_by_name (arch, dirname);
+      g_free (dirname);
+      if (!member)
+        return NULL;
+      dir = GSF_INFILE (member);
+      member = find_member (dir, slash + 1);
+      g_object_unref (dir);
+      return member;
+    } else {
+      return gsf_infile_child_by_name (arch, name);
+    }
+  }
+
+  /* ------------------------------------------------------------------------- */
+
+  static int
+  gsf_help (G_GNUC_UNUSED int argc, G_GNUC_UNUSED char **argv)
+  {
+    g_print (_("Available subcommands are...\n"));
+    g_print (_("* cat        output one or more files in archive\n"));
+    g_print (_("* dump       dump one or more files in archive as hex\n"));
+    g_print (_("* help       list subcommands\n"));
+    g_print (_("* list       list files in archive\n"));
+    g_print (_("* listprops  list document properties in archive\n"));
+    g_print (_("* props      print specified document properties\n"));
+    g_print (_("* createole  create OLE archive\n"));
+    g_print (_("* createzip  create ZIP archive\n"));
+    return 0;
+  }
+
+  /* ------------------------------------------------------------------------- */
+
+  static void
+  ls_R (GsfInput *input, char const *prefix)
+  {
+    char const *name = gsf_input_name (input);
+    GsfInfile *infile = GSF_IS_INFILE (input) ? GSF_INFILE (input) : NULL;
+    gboolean is_dir = infile && gsf_infile_num_children (infile) > 0;
+    char *full_name;
+    char *new_prefix;
+    GDateTime *modtime = gsf_input_get_modtime (input);
+    char *modtxt;
+
+    if (prefix) {
+      char *display_name = name ?
+        g_filename_display_name (name)
+        : g_strdup ("?");
+      full_name = g_strconcat (prefix,
+             display_name,
+             NULL);
+      new_prefix = g_strconcat (full_name, "/", NULL);
+      g_free (display_name);
+    } else {
+      full_name = g_strdup ("*root*");
+      new_prefix = g_strdup ("");
+    }
+
+    modtxt = modtime
+      ? g_date_time_format (modtime, "%F %H:%M:%S")
+      : g_strdup ("                   ");
+
+    g_print ("%c  %s  %10" GSF_OFF_T_FORMAT " %s\n",
+       (is_dir ? 'd' : 'f'),
+       modtxt,
+       gsf_input_size (input),
+       full_name);
+
+    g_free (modtxt);
+
+    if (is_dir) {
+      int i;
+      for (i = 0 ; i < gsf_infile_num_children (infile) ; i++) {
+        GsfInput *child = gsf_infile_child_by_index (infile, i);
+        /* We can get NULL here in case of file corruption.  */
+        if (child) {
+          ls_R (child, new_prefix);
+          g_object_unref (child);
+        }
+      }
+    }
+
+    g_free (full_name);
+    g_free (new_prefix);
+  }
+
+  static int
+  gsf_list (int argc, char **argv)
+  {
+    int i;
+
+    for (i = 0; i < argc; i++) {
+      char const *filename = argv[i];
+      char *display_name;
+      GsfInfile *infile = open_archive (filename);
+      if (!infile)
+        return 1;
+
+      if (i > 0)
+        g_print ("\n");
+
+      display_name = g_filename_display_name (filename);
+      g_print ("%s:\n", display_name);
+      g_free (display_name);
+
+      ls_R (GSF_INPUT (infile), NULL);
+      g_object_unref (infile);
+    }
+
+    return 0;
+  }
+
+  /* ------------------------------------------------------------------------- */
+
+  static int
+  gsf_dump (int argc, char **argv, gboolean hex)
+  {
+    char const *filename;
+    GsfInfile *infile;
+    int i;
+    int res = 0;
+
+    if (argc < 2)
+      return 1;
+
+    filename = argv[0];
+    infile = open_archive (filename);
+    if (!infile)
+      return 1;
+
+    for (i = 1; i < argc; i++) {
+      char const *name = argv[i];
+      GsfInput *member = find_member (infile, name);
+      if (!member) {
+        char *display_name = g_filename_display_name (name);
+        g_print ("%s: archive has no member %s\n",
+           g_get_prgname (), display_name);
+        g_free (display_name);
+        res = 1;
+        break;
+      }
+
+      if (hex) {
+        char *display_name = g_filename_display_name (name);
+        g_print ("%s:\n", display_name);
+        g_free (display_name);
+      }
+      gsf_input_dump (member, hex);
+      g_object_unref (member);
+    }
+
+    g_object_unref (infile);
+    return res;
+  }
+
+  static GsfDocMetaData *
+  get_meta_data (GsfInfile *infile, const char *filename)
+  {
+    GsfDocMetaData *meta_data = gsf_doc_meta_data_new ();
+
+    if (GSF_IS_INFILE_MSOLE (infile)) {
+      GsfInput *in;
+      GError *err;
+
+      in = gsf_infile_child_by_name (infile, "\05SummaryInformation");
+      if (NULL != in) {
+        err = gsf_doc_meta_data_read_from_msole (meta_data, in);
+        if (err != NULL) {
+          g_warning ("'%s' error: %s", filename, err->message);
+          g_error_free (err);
+          err = NULL;
+        }
+        g_object_unref (G_OBJECT (in));
+      }
+
+      in = gsf_infile_child_by_name (infile, "\05DocumentSummaryInformation");
+      if (NULL != in) {
+        err = gsf_doc_meta_data_read_from_msole (meta_data, in);
+        if (err != NULL) {
+          g_warning ("'%s' error: %s", filename, err->message);
+          g_error_free (err);
+          err = NULL;
+        }
+
+        g_object_unref (G_OBJECT (in));
+      }
+    }
+
+    return meta_data;
+  }
+
+  static int
+  gsf_dump_props (int argc, char **argv)
+  {
+    GsfInfile *infile;
+    GsfDocMetaData *meta_data;
+    char const *filename;
+    int res = 0;
+    int i;
+
+    if (argc < 2)
+      return 1;
+
+    filename = argv[0];
+    infile = open_archive (filename);
+    if (!infile)
+      return 1;
+
+    meta_data = get_meta_data (infile, filename);
+
+    for (i = 1; i < argc; i++) {
+      const char *name = argv[i];
+      GsfDocProp const *prop =
+        gsf_doc_meta_data_lookup (meta_data, name);
+      if (prop) {
+        if (argc > 2)
+          g_print ("%s: ", name);
+        gsf_doc_prop_dump (prop);
+      } else {
+        g_printerr (_("No property named %s\n"), name);
+      }
+    }
+
+    g_object_unref (meta_data);
+    g_object_unref (infile);
+    return res;
+  }
+
+  static void
+  cb_collect_names (gpointer key,
+        G_GNUC_UNUSED gpointer value,
+        gpointer user)
+  {
+    const char *name = key;
+    GSList **names = user;
+
+    ,*names = g_slist_prepend (*names, g_strdup (name));
+  }
+
+  static void
+  cb_print_names (const char *name)
+  {
+    g_print ("%s\n", name);
+  }
+
+  static int
+  gsf_list_props (int argc, char **argv)
+  {
+    GsfInfile *infile;
+    GsfDocMetaData *meta_data;
+    char const *filename;
+    GSList *names = NULL;
+
+    if (argc != 1)
+      return 1;
+
+    filename = argv[0];
+    infile = open_archive (filename);
+    if (!infile)
+      return 1;
+
+    meta_data = get_meta_data (infile, filename);
+    gsf_doc_meta_data_foreach (meta_data, cb_collect_names, &names);
+    names = g_slist_sort (names, (GCompareFunc)strcmp);
+    g_slist_foreach (names, (GFunc)cb_print_names, NULL);
+    g_slist_free (names);
+
+    g_object_unref (meta_data);
+    g_object_unref (infile);
+    return 0;
+  }
+
+  /* ------------------------------------------------------------------------- */
+
+  static void
+  show_error (char const *name, GError *error)
+  {
+    char *display_name;
+    display_name = g_filename_display_name (name);
+    g_printerr (_("%s: Error processing file %s: %s\n"),
+          g_get_prgname (),
+          display_name,
+          error->message);
+    g_free (display_name);
+  }
+
+  /* Walks "path" directory structure while loading it in "outfile" */
+  static void
+  load_recursively (GsfOutfile *outfile, char const *path)
+  {
+    GError *error = NULL;
+    GStatBuf statbuf;
+
+    if (g_stat (path, &statbuf) == -1) {
+      g_printerr ("Failed to stat %s: %s\n",
+            path, g_strerror (errno));
+      return;
+    }
+
+    if (S_ISDIR (statbuf.st_mode)) {
+      GsfInfile *in = gsf_infile_stdio_new (path, &error);
+      GsfOutfile *out;
+      int i, n;
+      char *base;
+
+      if (!in) {
+        show_error (path, error);
+        return;
+      }
+
+      base = g_path_get_basename (path);
+      out = GSF_OUTFILE (gsf_outfile_new_child (outfile, base, TRUE));
+      g_free (base);
+
+      n = gsf_infile_num_children (in);
+      for (i = 0; i < n; i++) {
+        char const *child = gsf_infile_name_by_index (in, i);
+        char *name = g_build_filename (path, child, NULL);
+        load_recursively (out, name);
+        g_free (name);
+      }
+
+      g_object_unref (out);
+      g_object_unref (in);
+    } else if (S_ISREG (statbuf.st_mode)) {
+      char *base;
+      GsfInput *in;
+      GsfOutput *out;
+      gboolean ok;
+
+      in = gsf_input_stdio_new (path, &error);
+      if (!in) {
+        show_error (path, error);
+        return;
+      }
+
+      base = g_path_get_basename (path);
+      out = gsf_outfile_new_child_full
+        (outfile, base, FALSE,
+         "modtime", gsf_input_get_modtime (in),
+         NULL);
+      g_printerr ("Adding %s\n", path);
+
+      ok = gsf_input_copy (in, out);
+      if (!ok)
+        g_printerr ("Error in adding member.\n");
+
+      ok = gsf_output_close (out);
+      if (!ok)
+        g_printerr ("Error in adding member (at close)\n");
+
+      g_object_unref (out);
+      g_free (base);
+
+
+      g_object_unref (in);
+    } else {
+      g_printerr ("Ignoring %s\n", path);
+    }
+  }
+
+  static int
+  gsf_create (int argc, char **argv, GType type)
+  {
+    char const *filename;
+    GError *error = NULL;
+    GsfOutput *dest;
+    GsfOutfile *outfile;
+    int i;
+    gboolean ok;
+
+    if (argc < 2)
+      return 1;
+
+    filename = argv[0];
+    if (strcmp (filename, "-") == 0)
+      dest = gsf_output_stdio_new_FILE (filename, stdout, TRUE);
+    else
+      dest = gsf_output_stdio_new (filename, &error);
+    if (error) {
+      show_error (filename, error);
+      return 1;
+    }
+
+    if (type == GSF_OUTFILE_MSOLE_TYPE)
+      outfile = gsf_outfile_msole_new (dest);
+    else if (type == GSF_OUTFILE_ZIP_TYPE) {
+      outfile = g_object_new (GSF_OUTFILE_ZIP_TYPE,
+            "sink", dest,
+            "zip64", opt_zip64,
+            NULL);
+    } else
+      g_assert_not_reached ();
+
+    if (error) {
+      show_error (filename, error);
+      return 1;
+    }
+
+    for (i = 1; i < argc; i++) {
+      GFile *file = g_file_new_for_commandline_arg (argv[i]);
+      char *path = g_file_get_path (file);
+      load_recursively (outfile, path);
+      g_free (path);
+      g_object_unref (file);
+    }
+
+    ok = gsf_output_close (GSF_OUTPUT (outfile));
+    if (!ok)
+      g_printerr ("Error while closing archive\n");
+
+    g_object_unref (dest);
+    g_object_unref (outfile);
+    return 0;
+  }
+
+  /* ------------------------------------------------------------------------- */
+
+  int
+  main (int argc, char **argv)
+  {
+    GOptionContext *ocontext;
+    GError *error = NULL;
+    char const *usage;
+    char const *cmd;
+    char const *me = (argv[0] ? argv[0] : "gsf");
+
+    g_set_prgname (me);
+    gsf_init ();
+
+    bindtextdomain (GETTEXT_PACKAGE, GSFLOCALEDIR);
+    textdomain (GETTEXT_PACKAGE);
+    setlocale (LC_ALL, "");
+
+    usage = _("SUBCOMMAND ARCHIVE...");
+    ocontext = g_option_context_new (usage);
+    g_option_context_add_main_entries (ocontext, gsf_options, GETTEXT_PACKAGE);
+    g_option_context_parse (ocontext, &argc, &argv, &error);
+    g_option_context_free (ocontext);
+
+    if (error) {
+      g_printerr (_("%s\nRun '%s --help' to see a full list of available command line options.\n"),
+            error->message, me);
+      g_error_free (error);
+      return 1;
+    }
+
+    if (show_version) {
+      g_print (_("gsf version %d.%d.%d\n"),
+         libgsf_major_version, libgsf_minor_version, libgsf_micro_version);
+      return 0;
+    }
+
+    if (argc <= 1) {
+      g_printerr (_("Usage: %s %s\n"), me, usage);
+      return 1;
+    }
+
+    cmd = argv[1];
+
+    if (strcmp (cmd, "help") == 0)
+      return gsf_help (argc - 2, argv + 2);
+
+    if (strcmp (cmd, "list") == 0 || strcmp (cmd, "l") == 0)
+      return gsf_list (argc - 2, argv + 2);
+
+    if (strcmp (cmd, "cat") == 0)
+      return gsf_dump (argc - 2, argv + 2, FALSE);
+    if (strcmp (cmd, "dump") == 0)
+      return gsf_dump (argc - 2, argv + 2, TRUE);
+    if (strcmp (cmd, "props") == 0)
+      return gsf_dump_props (argc - 2, argv + 2);
+    if (strcmp (cmd, "listprops") == 0)
+      return gsf_list_props (argc - 2, argv + 2);
+    if (strcmp (cmd, "createole") == 0)
+      return gsf_create (argc - 2, argv + 2, GSF_OUTFILE_MSOLE_TYPE);
+    if (strcmp (cmd, "createzip") == 0)
+      return gsf_create (argc - 2, argv + 2, GSF_OUTFILE_ZIP_TYPE);
+
+    g_printerr (_("Run '%s help' to see a list of subcommands.\n"), me);
+    return 1;
+  }
+#+end_src
+
+
+** /File/ ~msg.reader.js~
+   :PROPERTIES:
+   :CUSTOM_ID: msg_reader_js
+   :END:
+
+
+#+begin_src javascript
+  /* Copyright 2016 Yury Karpovich
+   ,*
+   ,* Licensed under the Apache License, Version 2.0 (the "License");
+   ,* you may not use this file except in compliance with the License.
+   ,* You may obtain a copy of the License at
+   ,*
+   ,*     http://www.apache.org/licenses/LICENSE-2.0
+   ,*
+   ,* Unless required by applicable law or agreed to in writing, software
+   ,* distributed under the License is distributed on an "AS IS" BASIS,
+   ,* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   ,* See the License for the specific language governing permissions and
+   ,* limitations under the License.
+   ,*/
+  /*
+   MSG Reader
+   ,*/
+
+  (function () {
+
+    // constants
+    var CONST = {
+      FILE_HEADER: uInt2int([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]),
+      MSG: {
+        UNUSED_BLOCK: -1,
+        END_OF_CHAIN: -2,
+
+        S_BIG_BLOCK_SIZE: 0x0200,
+        S_BIG_BLOCK_MARK: 9,
+
+        L_BIG_BLOCK_SIZE: 0x1000,
+        L_BIG_BLOCK_MARK: 12,
+
+        SMALL_BLOCK_SIZE: 0x0040,
+        BIG_BLOCK_MIN_DOC_SIZE: 0x1000,
+        HEADER: {
+          PROPERTY_START_OFFSET: 0x30,
+
+          BAT_START_OFFSET: 0x4c,
+          BAT_COUNT_OFFSET: 0x2C,
+
+          SBAT_START_OFFSET: 0x3C,
+          SBAT_COUNT_OFFSET: 0x40,
+
+          XBAT_START_OFFSET: 0x44,
+          XBAT_COUNT_OFFSET: 0x48
+        },
+        PROP: {
+          NO_INDEX: -1,
+          PROPERTY_SIZE: 0x0080,
+
+          NAME_SIZE_OFFSET: 0x40,
+          MAX_NAME_LENGTH: (/*NAME_SIZE_OFFSET*/0x40 / 2) - 1,
+          TYPE_OFFSET: 0x42,
+          PREVIOUS_PROPERTY_OFFSET: 0x44,
+          NEXT_PROPERTY_OFFSET: 0x48,
+          CHILD_PROPERTY_OFFSET: 0x4C,
+          START_BLOCK_OFFSET: 0x74,
+          SIZE_OFFSET: 0x78,
+          TYPE_ENUM: {
+            DIRECTORY: 1,
+            DOCUMENT: 2,
+            ROOT: 5
+          }
+        },
+        FIELD: {
+          PREFIX: {
+            ATTACHMENT: '__attach_version1.0',
+            RECIPIENT: '__recip_version1.0',
+            DOCUMENT: '__substg1.'
+          },
+          // example (use fields as needed)
+          NAME_MAPPING: {
+            // email specific
+            '0037': 'subject',
+            '0c1a': 'senderName',
+            '5d02': 'senderEmail',
+            '1000': 'body',
+            '1013': 'bodyHTML',
+            '007d': 'headers',
+            // attachment specific
+            '3703': 'extension',
+            '3704': 'fileNameShort',
+            '3707': 'fileName',
+            '3712': 'pidContentId',
+            '370e': 'mimeType',
+            // recipient specific
+            '3001': 'name',
+            '39fe': 'email'
+          },
+          CLASS_MAPPING: {
+            ATTACHMENT_DATA: '3701'
+          },
+          TYPE_MAPPING: {
+            '001e': 'string',
+            '001f': 'unicode',
+            '0102': 'binary'
+          },
+          DIR_TYPE: {
+            INNER_MSG: '000d'
+          }
+        }
+      }
+    };
+
+    // unit utils
+    function arraysEqual(a, b) {
+      if (a === b) return true;
+      if (a == null || b == null) return false;
+      if (a.length != b.length) return false;
+
+      for (var i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    }
+
+    function uInt2int(data) {
+      var result = new Array(data.length);
+      for (var i = 0; i < data.length; i++) {
+        result[i] = data[i] << 24 >> 24;
+      }
+      return result;
+    }
+
+    // MSG Reader implementation
+
+    // check MSG file header
+    function isMSGFile(ds) {
+      ds.seek(0);
+      return arraysEqual(CONST.FILE_HEADER, ds.readInt8Array(CONST.FILE_HEADER.length));
+    }
+
+    // FAT utils
+    function getBlockOffsetAt(msgData, offset) {
+      return (offset + 1) * msgData.bigBlockSize;
+    }
+
+    function getBlockAt(ds, msgData, offset) {
+      var startOffset = getBlockOffsetAt(msgData, offset);
+      ds.seek(startOffset);
+      return ds.readInt32Array(msgData.bigBlockLength);
+    }
+
+    function getNextBlockInner(ds, msgData, offset, blockOffsetData) {
+      var currentBlock = Math.floor(offset / msgData.bigBlockLength);
+      var currentBlockIndex = offset % msgData.bigBlockLength;
+
+      var startBlockOffset = blockOffsetData[currentBlock];
+
+      return getBlockAt(ds, msgData, startBlockOffset)[currentBlockIndex];
+    }
+
+    function getNextBlock(ds, msgData, offset) {
+      return getNextBlockInner(ds, msgData, offset, msgData.batData);
+    }
+
+    function getNextBlockSmall(ds, msgData, offset) {
+      return getNextBlockInner(ds, msgData, offset, msgData.sbatData);
+    }
+
+    // convert binary data to dictionary
+    function parseMsgData(ds) {
+      var msgData = headerData(ds);
+      msgData.batData = batData(ds, msgData);
+      msgData.sbatData = sbatData(ds, msgData);
+      if (msgData.xbatCount > 0) {
+        xbatData(ds, msgData);
+      }
+      msgData.propertyData = propertyData(ds, msgData);
+      msgData.fieldsData = fieldsData(ds, msgData);
+
+      return msgData;
+    }
+
+    // extract header data
+    function headerData(ds) {
+      var headerData = {};
+
+      // system data
+      headerData.bigBlockSize =
+        ds.readByte(/*const position*/30) == CONST.MSG.L_BIG_BLOCK_MARK ? CONST.MSG.L_BIG_BLOCK_SIZE : CONST.MSG.S_BIG_BLOCK_SIZE;
+      headerData.bigBlockLength = headerData.bigBlockSize / 4;
+      headerData.xBlockLength = headerData.bigBlockLength - 1;
+
+      // header data
+      headerData.batCount = ds.readInt(CONST.MSG.HEADER.BAT_COUNT_OFFSET);
+      headerData.propertyStart = ds.readInt(CONST.MSG.HEADER.PROPERTY_START_OFFSET);
+      headerData.sbatStart = ds.readInt(CONST.MSG.HEADER.SBAT_START_OFFSET);
+      headerData.sbatCount = ds.readInt(CONST.MSG.HEADER.SBAT_COUNT_OFFSET);
+      headerData.xbatStart = ds.readInt(CONST.MSG.HEADER.XBAT_START_OFFSET);
+      headerData.xbatCount = ds.readInt(CONST.MSG.HEADER.XBAT_COUNT_OFFSET);
+
+      return headerData;
+    }
+
+    function batCountInHeader(msgData) {
+      var maxBatsInHeader = (CONST.MSG.S_BIG_BLOCK_SIZE - CONST.MSG.HEADER.BAT_START_OFFSET) / 4;
+      return Math.min(msgData.batCount, maxBatsInHeader);
+    }
+
+    function batData(ds, msgData) {
+      var result = new Array(batCountInHeader(msgData));
+      ds.seek(CONST.MSG.HEADER.BAT_START_OFFSET);
+      for (var i = 0; i < result.length; i++) {
+        result[i] = ds.readInt32()
+      }
+      return result;
+    }
+
+    function sbatData(ds, msgData) {
+      var result = [];
+      var startIndex = msgData.sbatStart;
+
+      for (var i = 0; i < msgData.sbatCount && startIndex != CONST.MSG.END_OF_CHAIN; i++) {
+        result.push(startIndex);
+        startIndex = getNextBlock(ds, msgData, startIndex);
+      }
+      return result;
+    }
+
+    function xbatData(ds, msgData) {
+      var batCount = batCountInHeader(msgData);
+      var batCountTotal = msgData.batCount;
+      var remainingBlocks = batCountTotal - batCount;
+
+      var nextBlockAt = msgData.xbatStart;
+      for (var i = 0; i < msgData.xbatCount; i++) {
+        var xBatBlock = getBlockAt(ds, msgData, nextBlockAt);
+        nextBlockAt = xBatBlock[msgData.xBlockLength];
+
+        var blocksToProcess = Math.min(remainingBlocks, msgData.xBlockLength);
+        for (var j = 0; j < blocksToProcess; j++) {
+          var blockStartAt = xBatBlock[j];
+          if (blockStartAt == CONST.MSG.UNUSED_BLOCK || blockStartAt == CONST.MSG.END_OF_CHAIN) {
+            break;
+          }
+          msgData.batData.push(blockStartAt);
+        }
+        remainingBlocks -= blocksToProcess;
+      }
+    }
+
+    // extract property data and property hierarchy
+    function propertyData(ds, msgData) {
+      var props = [];
+
+      var currentOffset = msgData.propertyStart;
+
+      while (currentOffset != CONST.MSG.END_OF_CHAIN) {
+        convertBlockToProperties(ds, msgData, currentOffset, props);
+        currentOffset = getNextBlock(ds, msgData, currentOffset);
+      }
+      createPropertyHierarchy(props, /*property with index 0 (zero) always as root*/props[0]);
+      return props;
+    }
+
+    function convertName(ds, offset) {
+      var nameLength = ds.readShort(offset + CONST.MSG.PROP.NAME_SIZE_OFFSET);
+      if (nameLength < 1) {
+        return '';
+      } else {
+        return ds.readStringAt(offset, nameLength / 2);
+      }
+    }
+
+    function convertProperty(ds, index, offset) {
+      return {
+        index: index,
+        type: ds.readByte(offset + CONST.MSG.PROP.TYPE_OFFSET),
+        name: convertName(ds, offset),
+        // hierarchy
+        previousProperty: ds.readInt(offset + CONST.MSG.PROP.PREVIOUS_PROPERTY_OFFSET),
+        nextProperty: ds.readInt(offset + CONST.MSG.PROP.NEXT_PROPERTY_OFFSET),
+        childProperty: ds.readInt(offset + CONST.MSG.PROP.CHILD_PROPERTY_OFFSET),
+        // data offset
+        startBlock: ds.readInt(offset + CONST.MSG.PROP.START_BLOCK_OFFSET),
+        sizeBlock: ds.readInt(offset + CONST.MSG.PROP.SIZE_OFFSET)
+      };
+    }
+
+    function convertBlockToProperties(ds, msgData, propertyBlockOffset, props) {
+
+      var propertyCount = msgData.bigBlockSize / CONST.MSG.PROP.PROPERTY_SIZE;
+      var propertyOffset = getBlockOffsetAt(msgData, propertyBlockOffset);
+
+      for (var i = 0; i < propertyCount; i++) {
+        var propertyType = ds.readByte(propertyOffset + CONST.MSG.PROP.TYPE_OFFSET);
+        switch (propertyType) {
+          case CONST.MSG.PROP.TYPE_ENUM.ROOT:
+          case CONST.MSG.PROP.TYPE_ENUM.DIRECTORY:
+          case CONST.MSG.PROP.TYPE_ENUM.DOCUMENT:
+            props.push(convertProperty(ds, props.length, propertyOffset));
+            break;
+          default:
+            /* unknown property types */
+            props.push(null);
+        }
+
+        propertyOffset += CONST.MSG.PROP.PROPERTY_SIZE;
+      }
+    }
+
+    function createPropertyHierarchy(props, nodeProperty) {
+
+      if (nodeProperty.childProperty == CONST.MSG.PROP.NO_INDEX) {
+        return;
+      }
+      nodeProperty.children = [];
+
+      var children = [nodeProperty.childProperty];
+      while (children.length != 0) {
+        var currentIndex = children.shift();
+        var current = props[currentIndex];
+        if (current == null) {
+          continue;
+        }
+        nodeProperty.children.push(currentIndex);
+
+        if (current.type == CONST.MSG.PROP.TYPE_ENUM.DIRECTORY) {
+          createPropertyHierarchy(props, current);
+        }
+        if (current.previousProperty != CONST.MSG.PROP.NO_INDEX) {
+          children.push(current.previousProperty);
+        }
+        if (current.nextProperty != CONST.MSG.PROP.NO_INDEX) {
+          children.push(current.nextProperty);
+        }
+      }
+    }
+
+    // extract real fields
+    function fieldsData(ds, msgData) {
+      var fields = {
+        attachments: [],
+        recipients: []
+      };
+      fieldsDataDir(ds, msgData, msgData.propertyData[0], fields);
+      return fields;
+    }
+
+    function fieldsDataDir(ds, msgData, dirProperty, fields) {
+
+      if (dirProperty.children && dirProperty.children.length > 0) {
+        for (var i = 0; i < dirProperty.children.length; i++) {
+          var childProperty = msgData.propertyData[dirProperty.children[i]];
+
+          if (childProperty.type == CONST.MSG.PROP.TYPE_ENUM.DIRECTORY) {
+            fieldsDataDirInner(ds, msgData, childProperty, fields)
+          } else if (childProperty.type == CONST.MSG.PROP.TYPE_ENUM.DOCUMENT
+            && childProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.DOCUMENT) == 0) {
+            fieldsDataDocument(ds, msgData, childProperty, fields);
+          }
+        }
+      }
+    }
+
+    function fieldsDataDirInner(ds, msgData, dirProperty, fields) {
+      if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.ATTACHMENT) == 0) {
+
+        // attachment
+        var attachmentField = {};
+        fields.attachments.push(attachmentField);
+        fieldsDataDir(ds, msgData, dirProperty, attachmentField);
+      } else if (dirProperty.name.indexOf(CONST.MSG.FIELD.PREFIX.RECIPIENT) == 0) {
+
+        // recipient
+        var recipientField = {};
+        fields.recipients.push(recipientField);
+        fieldsDataDir(ds, msgData, dirProperty, recipientField);
+      } else {
+
+        // other dir
+        var childFieldType = getFieldType(dirProperty);
+        if (childFieldType != CONST.MSG.FIELD.DIR_TYPE.INNER_MSG) {
+          fieldsDataDir(ds, msgData, dirProperty, fields);
+        } else {
+          // MSG as attachment currently isn't supported
+          fields.innerMsgContent = true;
+        }
+      }
+    }
+
+    function isAddPropertyValue(fieldName, fieldTypeMapped) {
+      return fieldName !== 'body' || fieldTypeMapped !== 'binary';
+    }
+
+    function fieldsDataDocument(ds, msgData, documentProperty, fields) {
+      var value = documentProperty.name.substring(12).toLowerCase();
+      var fieldClass = value.substring(0, 4);
+      var fieldType = value.substring(4, 8);
+
+      var fieldName = CONST.MSG.FIELD.NAME_MAPPING[fieldClass];
+      var fieldTypeMapped = CONST.MSG.FIELD.TYPE_MAPPING[fieldType];
+
+      if (fieldName) {
+        var fieldValue = getFieldValue(ds, msgData, documentProperty, fieldTypeMapped);
+
+        if (isAddPropertyValue(fieldName, fieldTypeMapped)) {
+          fields[fieldName] = applyValueConverter(fieldName, fieldTypeMapped, fieldValue);
+        }
+      }
+      if (fieldClass == CONST.MSG.FIELD.CLASS_MAPPING.ATTACHMENT_DATA) {
+
+        // attachment specific info
+        fields['dataId'] = documentProperty.index;
+        fields['contentLength'] = documentProperty.sizeBlock;
+      }
+    }
+
+    // todo: html body test
+    function applyValueConverter(fieldName, fieldTypeMapped, fieldValue) {
+      if (fieldTypeMapped === 'binary' && fieldName === 'bodyHTML') {
+        return convertUint8ArrayToString(fieldValue);
+      }
+      return fieldValue
+    }
+
+    function getFieldType(fieldProperty) {
+      var value = fieldProperty.name.substring(12).toLowerCase();
+      return value.substring(4, 8);
+    }
+
+    // extractor structure to manage bat/sbat block types and different data types
+    var extractorFieldValue = {
+      sbat: {
+        'extractor': function extractDataViaSbat(ds, msgData, fieldProperty, dataTypeExtractor) {
+          var chain = getChainByBlockSmall(ds, msgData, fieldProperty);
+          if (chain.length == 1) {
+            return readDataByBlockSmall(ds, msgData, fieldProperty.startBlock, fieldProperty.sizeBlock, dataTypeExtractor);
+          } else if (chain.length > 1) {
+            return readChainDataByBlockSmall(ds, msgData, fieldProperty, chain, dataTypeExtractor);
+          }
+          return null;
+        },
+        dataType: {
+          'string': function extractBatString(ds, msgData, blockStartOffset, bigBlockOffset, blockSize) {
+            ds.seek(blockStartOffset + bigBlockOffset);
+            return ds.readString(blockSize);
+          },
+          'unicode': function extractBatUnicode(ds, msgData, blockStartOffset, bigBlockOffset, blockSize) {
+            ds.seek(blockStartOffset + bigBlockOffset);
+            return ds.readUCS2String(blockSize / 2);
+          },
+          'binary': function extractBatBinary(ds, msgData, blockStartOffset, bigBlockOffset, blockSize) {
+            ds.seek(blockStartOffset + bigBlockOffset);
+            return ds.readUint8Array(blockSize);
+          }
+        }
+      },
+      bat: {
+        'extractor': function extractDataViaBat(ds, msgData, fieldProperty, dataTypeExtractor) {
+          var offset = getBlockOffsetAt(msgData, fieldProperty.startBlock);
+          ds.seek(offset);
+          return dataTypeExtractor(ds, fieldProperty);
+        },
+        dataType: {
+          'string': function extractSbatString(ds, fieldProperty) {
+            return ds.readString(fieldProperty.sizeBlock);
+          },
+          'unicode': function extractSbatUnicode(ds, fieldProperty) {
+            return ds.readUCS2String(fieldProperty.sizeBlock / 2);
+          },
+          'binary': function extractSbatBinary(ds, fieldProperty) {
+            return ds.readUint8Array(fieldProperty.sizeBlock);
+          }
+        }
+      }
+    };
+
+    function readDataByBlockSmall(ds, msgData, startBlock, blockSize, dataTypeExtractor) {
+      var byteOffset = startBlock * CONST.MSG.SMALL_BLOCK_SIZE;
+      var bigBlockNumber = Math.floor(byteOffset / msgData.bigBlockSize);
+      var bigBlockOffset = byteOffset % msgData.bigBlockSize;
+
+      var rootProp = msgData.propertyData[0];
+
+      var nextBlock = rootProp.startBlock;
+      for (var i = 0; i < bigBlockNumber; i++) {
+        nextBlock = getNextBlock(ds, msgData, nextBlock);
+      }
+      var blockStartOffset = getBlockOffsetAt(msgData, nextBlock);
+
+      return dataTypeExtractor(ds, msgData, blockStartOffset, bigBlockOffset, blockSize);
+    }
+
+    function readChainDataByBlockSmall(ds, msgData, fieldProperty, chain, dataTypeExtractor) {
+      var resultData = new Int8Array(fieldProperty.sizeBlock);
+
+      for (var i = 0, idx = 0; i < chain.length; i++) {
+        var data = readDataByBlockSmall(ds, msgData, chain[i], CONST.MSG.SMALL_BLOCK_SIZE, extractorFieldValue.sbat.dataType.binary);
+        for (var j = 0; j < data.length; j++) {
+          resultData[idx++] = data[j];
+        }
+      }
+      var localDs = new DataStream(resultData, 0, DataStream.LITTLE_ENDIAN);
+      return dataTypeExtractor(localDs, msgData, 0, 0, fieldProperty.sizeBlock);
+    }
+
+    function getChainByBlockSmall(ds, msgData, fieldProperty) {
+      var blockChain = [];
+      var nextBlockSmall = fieldProperty.startBlock;
+      while (nextBlockSmall != CONST.MSG.END_OF_CHAIN) {
+        blockChain.push(nextBlockSmall);
+        nextBlockSmall = getNextBlockSmall(ds, msgData, nextBlockSmall);
+      }
+      return blockChain;
+    }
+
+    function getFieldValue(ds, msgData, fieldProperty, typeMapped) {
+      var value = null;
+
+      var valueExtractor =
+        fieldProperty.sizeBlock < CONST.MSG.BIG_BLOCK_MIN_DOC_SIZE ? extractorFieldValue.sbat : extractorFieldValue.bat;
+      var dataTypeExtractor = valueExtractor.dataType[typeMapped];
+
+      if (dataTypeExtractor) {
+        value = valueExtractor.extractor(ds, msgData, fieldProperty, dataTypeExtractor);
+      }
+      return value;
+    }
+
+    function convertUint8ArrayToString(uint8ArraValue) {
+      return new TextDecoder("utf-8").decode(uint8ArraValue);
+    }
+
+    // MSG Reader
+    var MSGReader = function (arrayBuffer) {
+      this.ds = new DataStream(arrayBuffer, 0, DataStream.LITTLE_ENDIAN);
+    };
+
+    MSGReader.prototype = {
+      /**
+       Converts bytes to fields information
+       @return {Object} The fields data for MSG file
+       ,*/
+      getFileData: function () {
+        if (!isMSGFile(this.ds)) {
+          return {error: 'Unsupported file type!'};
+        }
+        if (this.fileData == null) {
+          this.fileData = parseMsgData(this.ds);
+        }
+        return this.fileData.fieldsData;
+      },
+      /**
+       Reads an attachment content by key/ID
+       @return {Object} The attachment for specific attachment key
+       ,*/
+      getAttachment: function (attach) {
+        var attachData = typeof attach === 'number' ? this.fileData.fieldsData.attachments[attach] : attach;
+        var fieldProperty = this.fileData.propertyData[attachData.dataId];
+        var fieldTypeMapped = CONST.MSG.FIELD.TYPE_MAPPING[getFieldType(fieldProperty)];
+        var fieldData = getFieldValue(this.ds, this.fileData, fieldProperty, fieldTypeMapped);
+
+        return {fileName: attachData.fileName, content: fieldData};
+      }
+    };
+
+    window.MSGReader = MSGReader;
+
+  })();
+#+end_src
+** /File/ ~test-dump-msole.c~
+   :PROPERTIES:
+   :CUSTOM_ID: file_test_dump_msole_c
+   :END:
+
+ #+begin_src c :tangle test/test-dump-msole.c :mkdir yes
+  /* vim: set sw=8: -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
+  /*
+   ,* test-dump-msole.c: Export a msole file to a directory tree
+   ,*
+   ,* Copyright (C) 2002-2006	Jody Goldberg (jody@gnome.org)
+   ,*
+   ,* This program is free software; you can redistribute it and/or
+   ,* modify it under the terms of version 2.1 of the GNU Lesser General Public
+   ,* License as published by the Free Software Foundation.
+   ,*
+   ,* This program is distributed in the hope that it will be useful,
+   ,* but WITHOUT ANY WARRANTY; without even the implied warranty of
+   ,* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   ,* GNU General Public License for more details.
+   ,*
+   ,* You should have received a copy of the GNU Lesser General Public License
+   ,* along with this program; if not, write to the Free Software
+   ,* Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+   ,* USA
+   ,*/
+
+  #include <gsf/gsf-utils.h>
+
+  #include <gsf/gsf-input-stdio.h>
+  #include <gsf/gsf-infile.h>
+  #include <gsf/gsf-infile-msole.h>
+
+  #include <gsf/gsf-output-stdio.h>
+  #include <gsf/gsf-outfile.h>
+  #include <gsf/gsf-outfile-stdio.h>
+
+  #include <stdio.h>
+
+  static void
+  clone_ (GsfInput *input, GsfOutput *output)
+  {
+    guint8 const *data;
+    size_t len;
+    int i;
+
+    if (gsf_input_size (input) > 0) {
+      while ((len = gsf_input_remaining (input)) > 0) {
+        /* copy in odd sized chunks to exercise system */
+        if (len > 314)
+          len = 314;
+        if (NULL == (data = gsf_input_read (input, len, NULL))) {
+          g_warning ("error reading ?");
+          return;
+        }
+        if (!gsf_output_write (output, len, data)) {
+          g_warning ("error writing ?");
+          return;
+        }
+      }
+    }
+
+    /* See test-cp-msole.c for explanation how to distinct directories
+     ,* from regular files.
+     ,*/
+    if (GSF_IS_INFILE (input) &&
+        gsf_infile_num_children (GSF_INFILE (input)) > 0) {
+      GsfInfile *in = GSF_INFILE (input);
+      GsfOutfile *out = GSF_OUTFILE (output);
+      GsfInput *src;
+      GsfOutput *dst;
+      gboolean is_dir;
+
+      for (i = 0 ; i < gsf_infile_num_children (in) ; i++) {
+        src = gsf_infile_child_by_index (in, i);
+        is_dir = GSF_IS_INFILE (src) &&
+          gsf_infile_num_children (GSF_INFILE (src)) >= 0;
+        dst = gsf_outfile_new_child  (out,
+          gsf_infile_name_by_index  (in, i),
+          is_dir);
+        clone_ (src, dst);
+      }
+    }
+
+    gsf_output_close (output);
+    g_object_unref (G_OBJECT (output));
+    g_object_unref (G_OBJECT (input));
+  }
+
+  static int
+  test (char *argv[])
+  {
+    GsfInput   *input;
+    GsfInfile  *infile;
+    GsfOutfile *outfile;
+    GError    *err = NULL;
+
+    fprintf (stderr, "%s\n", argv [1]);
+    input = gsf_input_stdio_new (argv[1], &err);
+    if (input == NULL) {
+      g_return_val_if_fail (err != NULL, 1);
+
+      g_warning ("'%s' error: %s", argv[1], err->message);
+      g_error_free (err);
+      return 1;
+    }
+
+    infile = gsf_infile_msole_new (input, &err);
+    g_object_unref (G_OBJECT (input));
+
+    if (infile == NULL) {
+      g_return_val_if_fail (err != NULL, 1);
+
+      g_warning ("'%s' Not an OLE file: %s", argv[1], err->message);
+      g_error_free (err);
+      return 1;
+    }
+
+    outfile = gsf_outfile_stdio_new (argv[2], &err);
+    if (outfile == NULL) {
+      g_return_val_if_fail (err != NULL, 1);
+
+      g_warning ("'%s' error: %s", argv[1], err->message);
+      g_error_free (err);
+      return 1;
+    }
+    clone_ (GSF_INPUT (infile), GSF_OUTPUT (outfile));
+
+    return 0;
+  }
+
+  int
+  main (int argc, char *argv[])
+  {
+    int res;
+
+    if (argc != 3) {
+      fprintf (stderr, "%s : infile outdir\n", argv [0]);
+      return 1;
+    }
+
+    gsf_init ();
+    res = test (argv);
+    gsf_shutdown ();
+
+    return res;
+  }
+#+end_src
+
+* Footnotes
+
+[fn:gfs_input_read] https://developer.gnome.org/gsf/1.14/gsf-Input-from-unstructured-files.html#gsf-input-read
+
+[fn:gambc-c-lambda]  http://www.iro.umontreal.ca/~gambit/doc/gambit.html#c_002dlambda
+
+[fn:gfs-infile]  https://developer.gnome.org/gsf/1.14/gsf-Infile-reading-structed-files.html#GsfInfile
+
+[fn:rfc-2781]  https://tools.ietf.org/html/rfc2781
+
+[fn:gsf-git] https://github.com/GNOME/libgsf/
+
+[fn:gambc-types]  http://www.iro.umontreal.ca/~gambit/doc/gambit.html#mapping-of-types
+
+[fn:MS-OXCDATA] https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxcdata/ 
+
+[fn:MS-OXCMSG] https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxcmsg/
+
+[fn:MS-OXPROPS] https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxprops
+
+[fn:MS-OXMSG]  https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxmsg
+
+[fn:MS-CFB]  https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-cfb/
