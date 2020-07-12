@@ -39,5 +39,5 @@ find_member (GsfInfile *arch, char const *name)
 END-C
 )
 (define-c-GObject GsfInput (GsfInfile))
-(define-c-GObject GsfInfile)
+(define-c-GObject GsfInfile (GsfInput))
 (define find-member (c-lambda (GsfInfile* char-string) GsfInput* "find_member")))

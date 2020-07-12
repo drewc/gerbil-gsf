@@ -1,0 +1,392 @@
+#+TITLE: Gerbil GSF Manual
+Gerbil GSF is a library for reading and writing the Compound File Binary File
+Format, which is described in [fn:MS-CFB]. The paradigm provides for the concept
+of storages and streams, which are similar to directories and files, except that
+the entire hierarchy of storages and streams are packaged into a single file,
+called a compound file. This facility allows applications to store complex,
+structured data in a single file. For more information regarding structured
+storage in a compound file, see [MSDN-STS]
+
+* Introduction
+
+My clients use a lot of Microsoft software. So I can write a client that
+utilizes them for other purposes, I need to read the files they output.
+
+This is my take on that.
+
+#+begin_src gerbil
+  (import :drewc/gsf)
+#+end_src
+
+* Compound File: Storages and Streams
+  :PROPERTIES:
+  :CUSTOM_ID: gsf_storages_and_streams
+  :END:
+
+Structured storage defines how to treat a single file as a hierarchical
+collection of two types of objects--storage objects and stream objects--that
+behave as directories and files, respectively. This scheme is called structured
+storage"[fn:MS-CFB-intro]
+
+We're going to take an Outlook Item (.msg) File Format[fn:MS-OXMSG] and convert
+it into a *JSON* file.
+
+"A compound file is a structure that is used to store a hierarchy of storage
+objects and stream objects into a single file or memory buffer."
+
+#+begin_src gerbil :noweb-ref test-open-msg
+  (def msg (open-compound-file
+            "/home/user/src/gerbil-gsf/test/Outlook1.msg"))
+#+end_src
+
+All files, storages and streams are ~input?~'s.
+
+#+begin_src gerbil :noweb-ref test-input?-msg
+  (check (input? msg) => #t)
+#+end_src
+
+A file is and input so strangely enough it is also ~infile?~
+#+begin_src gerbil :noweb-ref test-msg-infile?
+  (check (infile? msg) => #t)
+#+end_src
+
+* Storage
+
+"A storage object is analogous to a file system directory. Just as a directory
+can contain other directories and files, a storage object can contain other
+storage objects and stream objects. Also like a directory, a storage object
+tracks the locations and sizes of the child storage object and stream objects
+that are nested beneath it."
+
+A compound file is a storage.
+
+#+begin_src gerbil :noweb-ref test-cfile-storage
+  (check (storage? msg) => #t)
+#+end_src
+
+It contains other objects as children.
+
+#+begin_src gerbil :noweb-ref test-cfile-children
+  (check (storage-children-count msg) => 85)
+#+end_src
+
+We can reference children by number using ~storage-ref~. They are all inputs.
+
+#+begin_src gerbil :noweb-ref test-input-first-child
+  (def first-child (storage-ref msg 0))
+  (check (input? first-child) => #t)
+#+end_src
+
+All children have a name unique to the child. ~input-name~ is the procedure.
+
+#+begin_src gerbil :noweb-ref test-first-input-name
+  (check (input-name first-child) => "__nameid_version1.0")
+#+end_src
+
+The name can be used with ~storage-ref~ as well.
+
+#+begin_src gerbil :noweb-ref test-first-storage-ref
+  (check (input-name (storage-ref msg (input-name first-child)))
+         => (input-name first-child))
+#+end_src
+
+There's a predicate which asks about equality for inputs: ~input=?~.
+
+#+begin_src gerbil :noweb-ref test-second-storage-ref
+  (check (input=? (storage-ref msg 0) (storage-ref msg "__nameid_version1.0"))
+         => #t)
+
+  (check (input=? msg first-child) => #f)
+#+end_src
+
+All children have parents. This is accessed using ~input-container~.
+
+#+begin_src gerbil :noweb-ref test-first-input-container
+  (check (input=? msg (input-container first-child)) => #t)
+#+end_src
+
+"The root storage object has no parent object. The root storage object also has
+no name. Because names are used to identify child objects, a name for the root
+storage object is unnecessary and the file format does not provide a
+representation for it."
+
+#+begin_src gerbil :noweb-ref test-root-name-container
+  (check (input-name msg) => #f)
+  (check (input-container msg) => #f)
+#+end_src
+
+Because this is a LISt Processing language, it's nice to have a list of children.
+
+#+begin_src gerbil :noweb-ref test-msg-children
+  (def msg-children (storage-children msg))
+#+end_src
+
+That list has all the children in the same order.
+
+#+begin_src gerbil :noweb-ref test-msg-children-order
+  (check (input=? (list-ref msg-children 2) (storage-ref msg 2))
+         => #t)
+#+end_src
+
+
+"A compound file consists of the root storage object with optional child storage
+objects and stream objects in a nested hierarchy."
+
+
+Because of that, our first child has children AKA grandchildren.
+
+#+begin_src gerbil :noweb-ref test-storage-first-child
+  (check (storage? first-child) => #t)
+  (check (storage-children-count first-child) => 22)
+#+end_src
+
+It's a large family of objects! Our ~storage-ref~ allows such tree tracing.
+
+#+begin_src gerbil
+  (check (input=? (storage-ref msg 0 0) (storage-ref first-child 0)) => #t)
+#+end_src
+
+We can also mix name and numbers.
+
+#+begin_src gerbil
+  (check (input=? (storage-ref msg "__nameid_version1.0" 3)
+                  (storage-ref first-child "__substg1.0_10000102"))
+         => #t)
+#+end_src
+
+* Streams
+
+
+"A stream object is analogous to the traditional notion of a file. Like a file,
+a stream contains user-defined data that is stored as a consecutive sequence of
+bytes."
+
+A child with a name of "__substg1.0_0037001F" is the stream for the subject of the message.
+
+#+begin_src gerbil :noweb-ref test-message-subject
+  (def msg-subject (storage-ref msg "__substg1.0_0037001F"))
+#+end_src
+
+It is a ~stream~ not a ~storage~.
+
+#+begin_src gerbil:noweb-ref test-message-subject?
+  (check (stream? msg-subject) => #t)
+  (check (storage? msg-subject) => #f)
+#+end_src
+
+The way to read a single byte from a stream is ~stream-read-u8~.
+
+#+begin_src gerbil :noweb-ref test-subject-first-byte
+  (def msg-subject-first-byte (stream-read-u8 msg-subject))
+  (check msg-subject-first-byte => 91)
+#+end_src
+
+If the stream is empty, it returns *EOF*. We can use that to read all bytes.
+
+#+begin_src gerbil :noweb-ref test-subject-rest-bytes
+  (def msg-subject-rest-bytes
+    (let (rb (cut stream-read-u8 msg-subject))
+      (call-with-output-u8vector
+       #u8() (lambda (p) (let lp ((byte (rb)))
+                      (if (eof-object? byte) p
+                          (begin (write-u8 byte p) (lp (rb)))))))))
+
+  (check msg-subject-rest-bytes => #u8(0 69 0 88 0 84 0 93 0 32 0 82 0 101 0 58 0
+  32 0 91 0 69 0 88 0 84 0 93 0 32 0 82 0 101 0 58 0 32 0 79 0 117 0 116 0 108 0
+  111 0 111 0 107 0 32 0 46 0 109 0 115 0 103 0 32 0 102 0 105 0 108 0 101 0 115
+  0))
+#+end_src
+
+** ~stream-size~ and ~stream-byte-position~
+ Like ports there is a ~stream-byte-position~.
+
+ #+begin_src gerbil
+   (def msg-subject-end-byte-position (stream-byte-position msg-subject))
+   (check msg-subject-end-byte-position => 76)
+ #+end_src
+
+ We are at the *EOF*. One way to know that is by trying to read the byte.
+
+ #+begin_src gerbil
+   (def msg-subject-eof (stream-read-u8 msg-subject))
+   (check (eof-object? msg-subject-eof) => #t)
+ #+end_src
+
+ Another way is to check the position against the ~stream-size~.
+
+ #+begin_src gerbil
+   (def msg-subject-stream-size (stream-size msg-subject))
+   (check msg-subject-stream-size => msg-subject-end-byte-position)
+ #+end_src
+
+ The procedure ~stream-byte-position~ also allows us to set it when calling with
+ 2 arguments.
+
+ #+begin_src gerbil
+   (def msg-subject-start-position
+     (begin (stream-byte-position msg-subject 0)
+            (stream-byte-position msg-subject)))
+
+   (check-predicate msg-subject-start-position zero?)
+ #+end_src
+
+ In fact, there are three arguments:
+
+   - ~stream-byte-position(stream, position, whence)~
+
+     1) When called with a single argument these procedures return the byte
+        position where the next I/O operation would take place in the stream
+        (relative to the beginning of the stream).
+
+     2) When called with two or three arguments, the byte position for subsequent
+        I/O operations on the given port is changed to position, which must be an
+        exact integer.
+
+     3) - When whence is omitted or is 0, the position is relative to the
+          beginning of the file.
+
+        - When whence is 1, the position is relative to the current byte position
+          of the file.
+
+        - When whence is 2, the position is relative to the end of the file.
+
+ The return value is the new byte position.
+
+ #+begin_src gerbil
+   (check (begin (stream-byte-position msg-subject 2) (stream-read-u8 msg-subject))
+     => 69)
+   (check (begin (stream-byte-position msg-subject 4 0) (stream-read-u8 msg-subject))
+     => 88)
+
+   (check (begin (stream-byte-position msg-subject 1 1) (stream-read-u8 msg-subject))
+          => 84)
+
+   (check (begin (stream-byte-position msg-subject -2 2) (stream-read-u8 msg-subject))
+          => 115)
+ #+end_src
+
+
+** ~write-stream-bytes~: *N* bytes read at once and written
+
+While we can read one byte and ~write_u8~ it, that's not terribly short, nor efficient.
+
+#+begin_src gerbil
+  (def (test-stream-read-all-u8-write-u8-inefficient strm)
+    (stream-byte-position strm 0)
+    (let ((p (open-output-u8vector))
+          (end (stream-size strm)))
+      (let lp ((n 0))
+        (if (= n end) (get-output-u8vector p)
+            (let (byte (stream-read-u8 strm))
+              (write-u8 byte p)
+              (lp (1+ n)))))))
+
+  (def msg-subject-inef-bytes (test-stream-read-all-u8-write-u8-inefficient msg-subject))
+
+  (check (list->u8vector (cdr (u8vector->list msg-subject-inef-bytes)))
+         => msg-subject-rest-bytes)
+#+end_src
+
+As luck would have it, there is a function that does just that built in: ~write-stream-bytes~
+
+#+begin_src gerbil
+  (def (test-write-stream-bytes-1024 strm)
+    (stream-byte-position strm 0)
+    (call-with-output-u8vector #u8() (cut write-stream-bytes strm <>)))
+
+  (def msg-subject-1024-bytes (test-write-stream-bytes-1024 msg-subject))
+
+  (check msg-subject-1024-bytes => msg-subject-inef-bytes)
+#+end_src
+
+The reason it has *1024* it its name is because that is the buffer size in
+bytes. We can set that using the ~:n~ keyword.
+
+#+begin_src gerbil
+  (def msg-subject-first-byte-u8
+    (begin (stream-byte-position msg-subject 0)
+           (call-with-output-u8vector
+            #u8() (cut write-stream-bytes msg-subject n: 1 <>))))
+
+  (check msg-subject-first-byte-u8 => (u8vector msg-subject-first-byte))
+#+end_src
+
+** ~stream-read-[all-as]-u8vector~: shorthand again
+
+We can get rid of the need to specify an output vector.
+
+#+begin_src gerbil
+  (def msg-subject-stream-u8vector
+    (begin (stream-byte-position msg-subject 0)
+           (stream-read-u8vector msg-subject)))
+
+  (check msg-subject-stream-u8vector => msg-subject-1024-bytes)
+#+end_src
+
+Like ~write-stream-bytes~ it takes a ~n:~ keyword with the default at *1024*.
+
+#+begin_src gerbil
+  (def msg-subject-first-byte-u8vector
+    (begin (stream-byte-position msg-subject 0)
+           (stream-read-u8vector msg-subject n: 1)))
+
+  (check msg-subject-first-byte-u8vector => msg-subject-first-byte-u8)
+#+end_src
+
+
+
+
+* Testing
+
+This file also literately defines and documents a test suite for *Gerbil GSF*.
+
+#+begin_src gerbil :noweb-ref all-tests :noweb yes
+  <<test-open-msg>>
+  <<test-cfile-storage>>
+  <<test-cfile-children>>
+  <<test-msg-infile?>>
+  <<test-cfile-storage>>
+  <<test-cfile-children>>
+  <<test-input-first-child>>
+  <<test-first-input-name>>
+  <<test-first-storage-ref>>
+  <<test-second-storage-ref>>
+  <<test-first-input-container>>
+  <<test-root-name-container>>
+  <<test-msg-children>>
+  <<test-msg-children-order>>
+  <<test-storage-first-child>>
+  <<test-message-subject>>
+  <<test-message-subject?>>
+  <<test-subject-first-byte>>
+  <<test-subject-rest-bytes>>
+#+end_src
+
+#+begin_src gerbil :noweb yes
+  (import :std/test :drewc/gsf)
+
+  (def test-gsf-manual
+    (test-suite
+     "Testing GSF Manual"
+    <<all-tests>>))
+#+end_src
+
+* REPL play
+
+#+begin_src gerbil
+  (import :std/interactive)
+
+  (reload :drewc/gsf/infile)
+  (reload :drewc/gsf/input)
+  (reload :drewc/gsf)
+
+  (import :std/test :drewc/gsf)
+  (import :drewc/gsf/infile :drewc/gsf/input :drewc/gsf)
+
+
+#+end_src
+* Footnotes
+
+[fn:MS-CFB-intro] https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-cfb/50708a61-81d9-49c8-ab9c-43c98a795242
+
+[fn:MS-CFB]  https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-cfb/

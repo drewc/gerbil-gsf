@@ -63,5 +63,5 @@ open_archive (char const *filename)
 END-C
 )
 (define-c-GObject GsfInput (GsfInfile))
-(define-c-GObject GsfInfile)
+(define-c-GObject GsfInfile (GsfInput))
 (define open-archive (c-lambda (char-string) GsfInfile* "open_archive")))

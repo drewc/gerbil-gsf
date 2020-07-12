@@ -38,120 +38,33 @@ that's the way to do it these days.
  #+end_src
  
 
- #+begin_src shell :session build :results output
- comp () {
- gxc  -cc-options "`pkg-config --cflags libgsf-1`"\
-      -ld-options "`pkg-config --libs libgsf-1`"\
-   $1
-  true;
- }
+** Building this library
+ #+begin_src shell :session  (if (get-buffer "build") (if (kill-buffer "build") (print "build") (print "build"))(print "build")) :results output
+    echo "reset build session"; true;
+ #+end_src
 
-   comp glib.ss
-   true
+ #+begin_src shell :session build :results output :tangle ./build.sh :shebang "#!/usr/bin/env bash"
+   export PKG_CONFIG_PATH=$(nix-shell -p libgsf pkgconfig mount libselinux libsepol \
+                              --run 'echo $PKG_CONFIG_PATH')
+
+   compile_gsf () {
+   gxc  -cc-options "`pkg-config --cflags libgsf-1`"\
+        -ld-options "`pkg-config --libs libgsf-1`" "$1";
+    return 0;
+   }
+
+   compile_gsf glib.ss;
+   compile_gsf infile.ss;
+   compile_gsf input.ss;
+   compile_gsf gsf.ss;
+
+
  #+end_src
 
  #+RESULTS:
 
+
  
-* ~glib.h~ and ~GObject~: The GLib Object System
-
-
-** ~define-c-GType~: A prelude macro
-   :PROPERTIES:
-   :CUSTOM_ID: define_c_gstruct
-   :END:
-
-We want a short form to have a type that does not have a release-function by default.
-
-  - define-c-GType :: (name (tags '()) (free #f))
-
-#+begin_src gerbil :noweb-ref define-c-GType
-  (define-macro (define-c-GType name . tags/free)
-    (let* ((str (symbol->string name))
-           (ptr (string->symbol (string-append str "*")))
-           (ptr-tags (cond ((and (pair? tags/free) (list? (car tags/free)))
-                            (cons ptr (car tags/free)))
-                           ((and (pair? tags/free) (eq? #f (car tags/free)))
-                            #f)
-                           (else (list ptr))))
-           (ptr-free (if (and (pair? tags/free)
-                            (string? (last tags/free)))
-                       (list (last tags/free))
-                       '())))
-    `(begin (c-define-type ,name ,str)
-            (c-define-type ,ptr (pointer ,str ,ptr-tags ,@ptr-free)))))
-#+end_src
-
-** ~gobj_free~: Our own ~g_object_unref~
-
- First things first, we'll make a function for the gerbil GC that frees the
- object when done. It will actually come last.
-
- #+begin_src c :noweb-ref gobj_free
- #ifndef ___HAVE_GOBJ_FREE
- #define ___HAVE_GOBJ_FREE
- ___SCMOBJ gobj_free (void *ptr)
- {
-  g_object_unref (ptr);
-  return ___FIX (___NO_ERR);
- }
- #endif
- #+end_src
-
-** ~define-c-GObject~: A prelude macro
-   :PROPERTIES:
-   :CUSTOM_ID: define_c_gobject
-   :END:
-
-
-Now that we have ~gobj_free~ we can make a way to easily define a gerbil
-interface to it.
-
-#+begin_src gerbil :noweb-ref define-c-GObject
-   (define-macro (define-c-GObject name . tags)
-     (let* ((str (symbol->string name))
-            (ptr (string->symbol (string-append str "*")))
-            (ptr-tags (cond ((and (pair? tags) (list? (car tags)))
-                             (cons ptr (car tags)))
-                            ((and (pair? tags) (eq? #f (car tags)))
-                             #f)
-                            (else (list ptr)))))
-
-
-     `(begin (c-define-type ,name ,str)
-             (c-define-type ,ptr (pointer ,str ,ptr-tags "gobj_free")))))
-#+end_src
-
-** /File/ ~glib.ss~
-
- #+begin_src gerbil :tangle glib.ss :noweb yes
-   (import :std/foreign (for-syntax :std/stxutil))
-   (export begin-glib-ffi)
-   (defsyntax (begin-glib-ffi stx)
-     (def (prelude-macros)
-       '(
-         <<define-c-GType>>
-         <<define-c-GObject>>
-         ))
-     (syntax-case stx ()
-       ((_ exports body ...)
-        (with-syntax (((macros ...) (prelude-macros)))
-          #'(begin-ffi
-             exports
-             macros ...
-             (c-declare "___SCMOBJ gobj_free(void *ptr);")
-             (c-declare "#include <glib.h>")
-             (define-c-GObject GObject #f)
-             (define-const TRUE)
-             (define-const FALSE)
-            body ...
-            (c-declare #<<END-C
-   <<gobj_free>>
-   END-C
-   ))))))
- #+end_src
-
-
 
 * Act 1: Read an Outlook ~.msg~ file
 
@@ -277,6 +190,9 @@ mean?
  #+end_example
 
 ** Scene 1: Find the ~Subject:~ header
+   :PROPERTIES:
+   :CUSTOM_ID: find_subject_header
+   :END:
 
    As much as I love reading documentation, I find code to be a better guide.
    Mixing the two in a literate fashion is even better, but I digress.
@@ -426,7 +342,8 @@ YAY!! We've now got the code and the knowledge to get it from gerbil. Let's go!
 
     Again, code! ~gsf.c~ has ~open_archive~ which does what we want.
 
-    It has a type to declare. 
+    It has a type to declare.
+
 
 #+begin_src c :noweb-ref open_archive_c
 static GsfInfile *
@@ -476,7 +393,6 @@ open_archive (char const *filename)
   return NULL;
 }
 #+end_src
-
 Here's the hierarchy from *Infile reading structed files*[fn:gfs-infile].
 
 Object Hierarchy
@@ -493,7 +409,7 @@ We can use that and a ~c-lambda()~[fn:gambc-c-lambda].
 
 #+begin_src gerbil :noweb-ref open-archive-objects
     (define-c-GObject GsfInput (GsfInfile))
-    (define-c-GObject GsfInfile)
+    (define-c-GObject GsfInfile (GsfInput))
 #+end_src
 
 #+begin_src gerbil :noweb-ref open-archive
@@ -503,7 +419,7 @@ We can use that and a ~c-lambda()~[fn:gambc-c-lambda].
 That with some includes give as a [[#file_open_archive_ss][file]], which we compile.
 
 
- #+begin_src shell :sh :session (if (get-buffer "build") (if (kill-buffer "build") (print "build") (print "build"))(print "build")) :results output
+ #+begin_src shell :sh :session build :results output
    export PKG_CONFIG_PATH=$(nix-shell -p libgsf pkgconfig mount libselinux libsepol \
                               --run 'echo $PKG_CONFIG_PATH')
    gxc -cc-options "`pkg-config --cflags libgsf-1`" -ld-options "`pkg-config --libs libgsf-1`" test/open-archive.ss
@@ -560,26 +476,30 @@ find_member (GsfInfile *arch, char const *name)
     We'll make a function in C which returns a pointer to a string.
 
 #+begin_src c :noweb-ref __GsfInput_to_string
-    static char *
-      __GsfInput_to_string (GsfInput *input)
-      {
-        guint8 const *data;
-        size_t len;
-        GString *str;
+  static char *
+    __GsfInput_to_string (GsfInput *input)
+    {
+      guint8  const *data;
+      size_t len;
+      GString *str;
+      char *ret;
 
-       len = gsf_input_size (input);
+      len = gsf_input_size (input);
 
-        if (NULL == (data = gsf_input_read (input, len, NULL))) {
-          g_warning ("error reading ?");
-          return;
-        }
-
-        str = g_string_new_len (data, len);
-
-        g_object_unref (G_OBJECT (input));
-
-        return g_string_free(str, FALSE);
+      if (NULL == (data = gsf_input_read (input, len, NULL))) {
+        g_warning ("error reading ?");
+        return;
       }
+      gsf_input_seek (input, 0, G_SEEK_SET); 
+
+      str = g_string_new_len (data, len);
+
+      ret = str->str;
+
+      g_string_free(str, FALSE);
+
+      return ret;
+    }
 #+end_src
 
 
@@ -675,7 +595,6 @@ And test it.
 #+end_src
 
 
-
  #+begin_src shell :results output
    export PKG_CONFIG_PATH=$(nix-shell -p libgsf pkgconfig mount libselinux libsepol \
                               --run 'echo $PKG_CONFIG_PATH')
@@ -743,82 +662,911 @@ And test it.
 
 
 
+** Scene 3:  Exchange properties: MS-OXPROPS documents
 
+ It turn out the name of a child that starts with *__substgis* an Exchange
+ property. *Jmcleodfoss/ms-oxprops-db*[fn:github-ms-oxprops] has a wonderful way
+ to grab them all in a .csv. We'll make a database with that csv and look it up
+ to decode them.
 
+*** The CSV file 
 
+    ~.csv~'s are quite simple and used all the time. Here are the columns.
 
+   1) Canonical Name
+   2) ID / LID
+   3) Data Type Name
+   4) Data Type Code
+   5) Property Set Name
+   6) Property Set GUID
+   7) Property Name
+   8) Alternate Name(s)
+   9) Area
+   10) Defining Reference(s)
+   11) Consuming Reference(s)
+   12) WebDAV
+   13) Description
+   14) Version
 
-
-
-
-** Scene 3:  
-** ~man gsf~
-
-#+begin_src shell :results output 
-man gsf
-#+end_src
+  The easy way to name things and access them that way is simply to meta-make a
+  struct that holds them. The simple reason for doing it this way is I don't
+  feel like naming all the fields I don't need.
 
 #+begin_example
-GSF(1)                               GNOME                              GSF(1)
+(make-struct-type id super fields name plist ctor [field-names = #f]) -> type-descriptor
 
-NAME
-       gsf - archiving utility using the G Structured File library
+  id          := symbol; the type id
+  super       := type-descriptor or #f; the struct type to inherit from
+  fields      := fixnum; number of (new) fields in the type
+  name        := symbol; the (displayed) type name
+  plist       := alist; type properties
+  ctor        := symbol or #f; id of constructor method
+  field-names := list of symbols or #f; (displayed) field names
 
-SYNOPSIS
-       gsf [OPTION...] SUBCOMMAND ARCHIVE...
+plist elements:
+ (transparent: . boolean) ; controls whether the object is transparent
+                            in equality and printing
+ (final: . boolean)       ; controls whether the class if final
+ (print: field ...)       ; printable field names
+ (equal: field ...)       ; equality comparable field names
 
-DESCRIPTION
-       This manual page briefly documents the gsf command.
-
-       gsf  is  a simple archive utility, somewhat similar to tar(1). It oper‐
-       ates on files following one of the structured file  formats  understood
-       by  the  G  Structured  File  library, for example, Microsoft Excel(TM)
-       files.
-
-OPTIONS
-   Options
-       -?, --help
-              Show help options
-
-       -v, --version
-              Display gsf's version
-
-   Subcommands
-       cat    Output one or more files in archive
-
-       dump   Dump one or more files in archive as formatted hexadecimal
-
-       help   List subcommands
-
-       list   List files in archive
-
-       props  Archive list of property names
-
-EXAMPLES
-       To list the content structure of a Microsoft Excel(TM) file arrays.xls:
-
-       gsf list arrays.xls
-
-       To dump Workbook, an individual data stream in arrays.xls:
-
-       gsf dump arrays.xls Workbook
-
-AUTHORS
-       gsf's primary authors are Morten Welinder  <terra@gnome.org>  and  Jody
-       Goldberg <jody@gnome.org>.
-
-       The  initial version of this manpage was written by J.H.M. Dassen (Ray)
-       <jdassen@debian.org>.
-
-SEE ALSO
-       gnumeric(1)
-
-       The Gnumeric homepage ⟨http://www.gnome.org/projects/gnumeric/⟩
-
-       The GNOME project page ⟨http://www.gnome.org/⟩
-
-gsf                            29 November 2009                         GSF(1)
+ -- https://cons.io/reference/core-builtin.html#make-struct-type
 #+end_example
+
+  #+begin_src gerbil :noweb-ref ms-oxprop-csv
+
+    (def ms-oxprop-csv::type (make-struct-type 'ms-oxprop-csv #f 14 'ms-oxprop-csv [] #f #f))
+
+    (def (ms-oxprop-csv . fields)
+      (apply make-struct-instance ms-oxprop-csv::type fields))
+  #+end_src
+
+Now we can open the CSV and read a struct.
+
+#+begin_src gerbil
+  (def test-line (with-input-from-file "var/ms-oxprops-2020-05-25.csv"
+                   (lambda () (read-line) (read-csv-line
+                                      (current-input-port)))))
+
+  (def test-struct (apply ms-oxprop-csv test-line))
+#+end_src
+
+
+I only want access to 5 fields.
+
+#+begin_src gerbil :noweb-ref mx-oxprop-csv-fields
+  (def ms-oxprop-csv-name (make-struct-field-accessor ms-oxprop-csv::type 0))
+  (def ms-oxprop-csv-id (make-struct-field-accessor ms-oxprop-csv::type 1))
+  (def ms-oxprop-csv-type-name (make-struct-field-accessor ms-oxprop-csv::type 2))
+  (def ms-oxprop-csv-type-id (make-struct-field-accessor ms-oxprop-csv::type 3))
+  (def ms-oxprop-csv-area (make-struct-field-accessor ms-oxprop-csv::type 8))
+#+end_src
+
+For a key in the db and cache we'll take the id and type-id and put them
+together.
+
+#+begin_src gerbil :noweb-ref ms-oxprop-csv-key
+  (def (ms-oxprop-csv-key prop (type-only? #f))
+    (let* ((id (ms-oxprop-csv-id prop))
+           (tid (ms-oxprop-csv-type-id prop))
+           (tdrop (if (equal? tid "") tid (string-drop tid 2)))
+           (key (string-append (if (equal? id "") id (string-drop id 2))
+                               tdrop)))
+      (if (equal? key "") #f (if type-only? tdrop key))))
+#+end_src
+
+*** LMBD for properties
+
+Now for a little bit of ~lmdb~.
+
+  #+begin_src gerbil :tangle test/lmdb.ss
+    (import :std/db/lmdb :std/sugar )
+    (export (import: :std/db/lmdb) lmdb-env call-with-transaction)
+
+    (def lmdb-env (lmdb-open "ms-oxprops"))
+
+    (def (call-with-transaction fn)
+      (let (txn (lmdb-txn-begin lmdb-env))
+        (try
+         (begin0 (fn txn)
+           (lmdb-txn-commit txn))
+         (catch (e) (lmdb-txn-abort txn)
+                (displayln (error-message e))
+                (raise e)))))
+  #+end_src
+
+#+begin_src shell :results values code :session build
+compile test/lmdb.ss
+#+end_src
+
+Now the csv.
+
+*** The ms-oxprop-db
+
+#+begin_src gerbil :tangle test/ms-oxprop-db.ss :noweb yes
+  (import :std/sugar :std/text/csv :std/srfi/13 :drewc/gsf/test/lmdb)
+  (export #t)
+
+  <<ms-oxprop-csv>>
+
+  <<mx-oxprop-csv-fields>>
+
+  <<ms-oxprop-csv-key>>
+
+  (def ms-oxprop-db (lmdb-open-db lmdb-env "ms-oxprop"))
+
+  (defstruct ms-oxprop
+    (name id type type-id area) transparent: #t)
+
+
+  (def (ms-oxprop-db-put! txn csv-line)
+    (let* ((csv (apply ms-oxprop-csv csv-line))
+           (prop (list
+                  (string->symbol (ms-oxprop-csv-name csv))
+                  (ms-oxprop-csv-id csv)
+                  (string->symbol (ms-oxprop-csv-type-name csv))
+                  (ms-oxprop-csv-type-id csv)
+                  (ms-oxprop-csv-area csv)))
+           (key (ms-oxprop-csv-key csv))
+           (type-key (ms-oxprop-csv-key csv #t))
+           (val (with-output-to-string "" (cut write prop))))
+      (when (string? key)
+        (if (< 0 (string-length type-key))
+          (lmdb-put txn ms-oxprop-db type-key (ms-oxprop-csv-type-name csv)))
+        (try
+         (lmdb-put txn ms-oxprop-db key val)
+         (catch (e)
+           (displayln "Error: " (error-message e) key val)
+           (error "Error: " (error-message e) key val))))))
+
+  (def (ms-oxprop-db-get txn key)
+    (let (v (lmdb-get txn ms-oxprop-db key))
+      (if (not v) #f
+          (let (v (with-input-from-u8vector v read))
+            (if (pair? v)
+              (apply make-ms-oxprop v)
+              v)))))
+
+
+  (def (upsert-oxprops (csv "var/ms-oxprops-2020-05-25.csv"))
+    (call-with-input-file csv
+      (lambda (port) (read-line port)
+         (call-with-transaction
+          (lambda (txn)
+            (let up ((line (read-csv-line port)))
+              (if (null? line) (eof-object)
+                  (begin (ms-oxprop-db-put! txn line)
+                         (up (read-csv-line port))))))))))
+#+end_src
+
+
+#+begin_src shell :results values code :session build
+compile test/ms-oxprop-db.ss
+#+end_src
+
+
+*** A list of children
+
+This one is quite easy. ~gsf_infile_num_children~ and
+~gsf_infile_child_by_index~[fn:GsfInfile] can do that.
+
+So let's make them lambdas.
+
+#+begin_src gerbil :noweb-ref infile-num-children-and-child-by-index
+  (define infile-num-children
+    (c-lambda (GsfInfile*) int "gsf_infile_num_children"))
+  (define infile-child-by-index
+    (c-lambda (GsfInfile* int) GsfInput* "gsf_infile_child_by_index"))
+#+end_src
+
+Now make a list from that.
+
+
+#+begin_src gerbil :noweb-ref infile-children
+  (def (infile-children inf)
+    (let (num (infile-num-children inf))
+      (cond ((= num -1) #f)
+            ((= num 0) [])
+            (else
+             (let infc ((n 0))
+               (cons (infile-child-by-index inf n)
+                     (if (= (1- num) n) []
+                         (infc (+ 1 n)))))))))
+#+end_src
+
+*** The ~ms-oxprop~ of a ~__substg~ and ~input-value~
+
+    All ~GsfInput~'s have a name it seems, and ~gsf_input_name~[fn:gsf-infile]
+    Gives us the name to lookup.
+
+
+If the name starts with ~__substg~ it is, so to speak, a header. In defined
+reality it's a substorage.
+
+#+begin_src gerbil :noweb-ref input-substg?
+  (def (input-substg? input)
+    (string-prefix? "__substg" (input-name input)))
+#+end_src
+
+Everything after the last ~#\_~ is the key.
+
+#+begin_src gerbil :noweb-ref input-ms-oxprop-key
+  (def (input-ms-oxprop-key input)
+    (let (name (input-name input))
+      (try (substring/shared name (1+ (string-index-right name #\_)))
+           (catch (_) name))))
+#+end_src
+
+Strangely enough even though our database contains a tonne of items, in the
+first test there no matching values for some keys. So we backed up and added a
+type to the db.
+
+#+begin_src gerbil :noweb-ref input-ms-oxprop
+  (def (input-ms-oxprop input)
+    (let* ((key (input-ms-oxprop-key input))
+           (val (when key (call-with-transaction (cut ms-oxprop-db-get <> key)))))
+      (or val
+          ;; We don't have anything. Let's make a new one.
+          (let* ((key (when key (string-take-right key 4)))
+                 (val (when key (call-with-transaction (cut ms-oxprop-db-get <> key))))
+                 (name (input-name input)))
+            (make-ms-oxprop name #f val (string-append "0x" key) "Unknown")))))
+#+end_src
+
+
+#+begin_src gerbil :noweb-ref substg-value-as-string
+  (def (substg-value-as-string input)
+    (and (input-substg? input)
+         (let* ((oxprop (input-ms-oxprop input))
+                (ptype (ms-oxprop-type oxprop)))
+           (case ptype
+             ((PtypString) (input->string input))
+             (else (void))))))
+
+
+#+end_src
+
+
+*** /File/ ~test/substg-string.ss~
+#+begin_src gerbil :noweb yes :tangle test/substg-string.ss
+   (import :std/sugar :std/text/csv :std/srfi/13
+           :drewc/gsf/test/lmdb :drewc/gsf/test/ms-oxprop-db
+           :drewc/gsf/test/input-to-string :drewc/gsf/test/list-children)
+   (export substg-value-as-string input-substg? input-ms-oxprop-key input-ms-oxprop)
+   <<input-substg?>>
+   <<input-ms-oxprop-key>>
+   <<input-ms-oxprop>>
+   <<substg-value-as-string>>
+
+#+end_src
+
+*** /File/ ~test/list-children.ss~
+#+begin_src gerbil :noweb yes :tangle test/list-children.ss
+  (import (for-syntax :drewc/gsf/glib) :std/foreign :drewc/gsf/glib)
+  (export infile-children infile-num-children infile-child-by-index input-name)
+
+  (begin-glib-ffi (infile-num-children infile-child-by-index input-name)
+
+    (c-declare #<<END-C
+
+
+  #include <gsf/gsf.h>
+  #include <glib/gi18n.h>
+  #include <glib/gstdio.h>
+  #include <gio/gio.h>
+  #include <locale.h>
+  #include <string.h>
+  #include <errno.h>
+  END-C
+  ) 
+
+    <<open-archive-objects>>
+    (define input-name (c-lambda (GsfInput*) UTF-8-string "gsf_input_name"))
+    <<infile-num-children-and-child-by-index>>
+  )
+  <<infile-children>>
+#+end_src
+
+
+** Scene 4: Convert UTF-16LE with carriage returns to UTF-8 /sans CR/
+
+   Ok, so we have a string, but it really doesn't work in gerbil. First off, DOS
+   line breaks are a PITA, and because it is LE and though I said BOM, blah blah
+   blah, it still seems messed up.
+
+   Also, we don't ~free()~ it, so eating memory.
+
+   So, best to covert it using C, which GSF does, and change the C string to Scheme, then free the
+
+ - GObject
+   - GsfInput
+   - GsfOutput
+     - GsfOutputMemory
+     - GsfOutputIconv
+
+#+begin_src gerbil :noweb-ref test-iconv-objects
+    (define-c-GObject GsfInput #f)
+#+end_src
+*** /C function/ substg_to_utf8_string
+
+#+begin_src c :noweb-ref substg_to_utf8_string
+  static const char *
+  substg_to_utf8_string (GsfInput *input)
+  {
+    guint8  const *data;
+    GsfOutput *iconv, *master;
+    size_t len;
+    GString *str;
+    char *ret;
+
+    master = gsf_output_memory_new ();
+
+    iconv = gsf_output_iconv_new (master, "UTF-8", "UTF-16LE");
+
+    if (!gsf_input_copy (input, iconv)) {
+      g_warning ("error reading ?");
+      return;
+    }
+
+    gsf_input_seek (input, 0, G_SEEK_SET);
+    gsf_output_close(iconv);
+    gsf_output_close(master);
+
+    len = gsf_output_size(master);
+    data = gsf_output_memory_get_bytes (GSF_OUTPUT_MEMORY(master));
+    str = g_string_new_len (data, len);
+
+    ret = g_string_free(str, FALSE);
+
+    return ret;
+  }
+
+  static void* _identity_ (void* i)
+   { return i; };
+#+end_src
+
+*** /C and Scheme Functions/ ~substg->string~ /et al/
+
+    The idea is simple. Convert to a ~scheme-object~ and ~g_free()~ the string.
+
+    Give us what we need from C.
+
+#+begin_src gerbil :noweb-ref substg-to-char
+  (define substg->char* (c-lambda (GsfInput*) (pointer char #f) "____return((char*)substg_to_utf8_string(____arg1));"))
+  (define char*->string (c-lambda ((pointer char)) UTF-8-string "___return((char *) ___arg1);"))
+  (define g-free (c-lambda ((pointer void)) void "g_free"))
+
+#+end_src
+
+And the gerbil side.
+
+#+begin_src gerbil :noweb-ref substg->string
+  (def (substg->string input)
+    (let* ((char* (substg->char* input))
+           (str (char*->string char*)))
+      (begin0 (string-delete (cut char=? <> #\return) str) (g-free char*))))
+#+end_src
+
+*** Test it out
+#+begin_src gerbil
+  (import :drewc/gsf/test/find-member
+          :drewc/gsf/test/open-archive
+          :drewc/gsf/test/iconv
+          :drewc/gsf/test/ms-oxprop-db
+          :drewc/gsf/test/list-children
+          :drewc/gsf/test/substg-string
+          :std/test)
+
+  (def msg (open-archive "/home/user/src/gerbil-gsf/test/Outlook1.msg"))
+
+  [MS-OXBBODY]: Best Body Retrieval Algorithm
+
+  https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxbbody/98296160-746e-4b25-8d45-676dabebb57d
+
+  (def body (find-member msg "__substg1.0_1000001F"))
+
+  (check (input-size body) => 6056)
+
+  (def body-string (substg->string body))
+
+  (check (string-length body-string) => 2952)
+
+  (def attachment (find-member msg "__attach_version1.0_#00000000"))
+
+  ;; ("__substg1.0_37010102" . #<ms-oxprop #130 name: PidTagAttachDataBinary
+  ;; id: "0x3701" type: PtypBinary type-id: "0x0102" area: "Message Attachment
+  ;; Properties">)
+  (def attachment-binary (find-member attachment "__substg1.0_37010102"))
+  ;; (def body-rtf (find-member msg "__substg1.0_10090102"))
+
+  ;; (check (ms-oxprop-name (input-ms-oxprop body-rtf))
+  ;;        => 'PidTagRtfCompressed)
+  ;; (check (ms-oxprop-type (input-ms-oxprop body-rtf))
+  ;;        => 'PtypBinary)
+
+  ;; All raw byte sequences are encoded by a length value followed by the specified
+  ;; number of bytes. The length value is encoded as a PtypInteger32 ([MS-OXCDATA]
+  ;; section 2.11.1) as shown in section 2.9.6.1. For example, the byte sequence 0x22
+  ;; 0xF8 0xFF 0x00 0x22 would be encoded as 0x05 0x22 0xF8 0xFF 0x00 0x22. A zero
+  ;; length PtypBinary ([MS-OXCDATA] section 2.11.1) value MUST NOT be encoded, but
+  ;; MUST be marked as not present in the presenceBitArray.
+
+  ;; (def (bytes->integer bytes)
+  ;;   (let lp ((i 0) (r 0))
+  ;;     (if (fx< i (u8vector-length bytes))
+  ;;       (let (b (u8vector-ref bytes i))
+  ;;         (lp (fx1+ i) (bitwise-ior (arithmetic-shift r 8) b)))
+  ;;       r)))
+
+  ;; (def (integer->bytes x)
+  ;;   (let lp ((x x) (r []))
+  ;;     (if (positive? x)
+  ;;       (lp (arithmetic-shift x -8)
+  ;;           (cons (bitwise-and x #xff) r))
+  ;;       (list->u8vector r))))
+#+end_src
+
+*** /File/ ~test/iconv.ss~
+
+#+begin_src gerbil :tangle test/iconv.ss :noweb yes
+  (import (for-syntax :drewc/gsf/glib) :std/foreign
+          :drewc/gsf/glib :std/srfi/13)
+  (export substg->string substg-test substg->char* char*->string input-size)
+
+  (begin-glib-ffi (substg->char* char*->string g-free substg-test input-size)
+
+    (c-declare #<<END-C
+
+
+  #include <gsf/gsf.h>
+  #include <glib/gi18n.h>
+  #include <glib/gstdio.h>
+  #include <gio/gio.h>
+  #include <locale.h>
+  #include <string.h>
+  #include <errno.h>
+
+  <<substg_to_utf8_string>>
+
+
+  END-C
+  )
+
+  <<test-iconv-objects>>
+  <<substg-to-char>>
+
+  (define input-size (c-lambda (GsfInput*) size_t "gsf_input_size"))
+   <<substg->string>>
+#+end_src
+
+#+begin_src gerbil :noweb-ref input-size-read-seek
+  (define input-read (c-lambda (GsfInput* size_t) (pointer char) "gsf_input_read(___arg1, ___arg2, NULL);"))
+  (define input-seek (c-lambda (GsfInput* size_t) bool
+                          "gsf_input_seek(___arg1, ___arg2, G_SEEK_SET);"))
+
+  (define test-read (c-lambda (GsfInput*) UTF-8-string "GsfTestRead"))
+
+#+end_src
+
+** Scene 5: Make attachments into files
+
+ We've almost got the whole message extracted. But we do so in memory. For email
+ messages, currently, that is not a terrible idea. For attachments it most
+ certainly is a *BAD IDEA*!.
+
+
+*** Make u8vector
+
+This one seems pretty easy.
+
+  1) Make a ~c-define~ function ~write_u8(guint8, scheme-port)~ which does just that.
+  2) Make a C function ~scm_read_bytes_from_input(GsfInput*, num, scheme-port)~ which calls that.
+  3) Make scheme function ~read-bytes-from-input(GsfInput* (size #f))~
+  4) FFI to ~gsf_input_seek~ and ~gsf_input_tell~ called ~input-byte-position(GsfInput*)~
+
+
+**** ~write_u8~
+  #+begin_src gerbil :noweb-ref write_u8
+    (c-define (write-unsigned-int8 int port) (unsigned-int8 scheme-object)
+              void "write_u8" "static"
+     (write-u8 int port)
+     #f)
+  #+end_src
+
+**** ~scm_read_bytes_from_input~
+
+ #+begin_src c :noweb-ref scm_read_bytes_from_input
+   guint64 scm_read_bytes_from_input(GsfInput *input, size_t n,  ___SCMOBJ port) {
+
+       guint8 const *data;
+       guint64 count = 0;
+       size_t i;
+       gsf_off_t start_offset, remaining;
+
+       start_offset = gsf_input_tell (input);
+       remaining = gsf_input_remaining (input);
+
+       n = (n > remaining) ? remaining : n;
+
+       if (NULL == (data = gsf_input_read (input, n, NULL))) {
+         g_warning("Error reading from input: gsf_input_read = NULL");
+         gsf_input_read (input, 0, NULL);
+         gsf_input_seek (input, start_offset, G_SEEK_SET);
+         return 0;
+       }
+
+       for (i = 0; i < n; ++i) {
+         write_u8 (*(data + i), port);
+         count++;
+       }
+
+       gsf_input_read (input, 0, NULL);
+       return count;
+   }
+ #+end_src
+
+**** ~read-bytes-from-input~
+ #+begin_src gerbil :noweb-ref read-bytes-from-input
+   (define read-bytes-from-input
+     (c-lambda (GsfInput* size_t scheme-object) unsigned-int64
+               "scm_read_bytes_from_input"))
+ #+end_src
+
+
+**** ~input-tell~ and ~input-seek~ with ~G_SEEK_[*]~
+b
+ #+begin_src gerbil :noweb-ref input-tell-and-seek
+   (define input-tell (c-lambda (GsfInput*) unsigned-int64 "gsf_input_tell"))
+
+   (define input-seek
+     (c-lambda (GsfInput* size_t int) bool
+               "gsf_input_seek"))
+
+   ;; https://developer.gnome.org/glib/2.62/glib-IO-Channels.html#GSeekType
+   ;; enum GSeekType
+   ;; An enumeration specifying the base position for a g_io_channel_seek_position() operation.
+
+   ;; Members
+   ;; G_SEEK_CUR the current position in the file.
+   ;; G_SEEK_SET the start of the file.
+   ;; G_SEEK_END the end of the file.
+
+   (define-const G_SEEK_CUR)
+   (define-const G_SEEK_SET)
+   (define-const G_SEEK_END)
+ #+end_src
+
+**** ~input-byte-position~
+
+ #+begin_src gerbil :noweb-ref input-byte-position
+
+   ;; When called with a single argument these procedures return the byte position
+   ;; where the next I/O operation would take place in the file attached to the
+   ;; given port (relative to the beginning of the file).
+
+   ;; When called with two or three arguments, the byte position for subsequent I/O
+   ;; operations on the given port is changed to position, which must be an exact
+   ;; integer.
+
+   ;; When whence is omitted or is 0, the position is relative to the beginning of
+   ;; the file.
+
+   ;; When whence is 1, the position is relative to the current byte position of
+   ;; the file.
+
+   ;; When whence is 2, the position is relative to the end of the file. The return
+   ;; value is the new byte position.
+
+   ;; On most operating systems the byte position for reading and writing of a
+   ;; given bidirectional port are the same. -
+
+   ;; --http://www.iro.umontreal.ca/~gambit/doc/gambit.html#I_002fO-and-ports
+
+   (def (input-byte-position input (position #f) (whence #f))
+     (def whence-alist `((0 . ,G_SEEK_SET)
+                         (1 . ,G_SEEK_CURR)
+                         (2 . ,G_SEEK_END)))
+     (let (whence (if (not whence) G_SEEK_SET (assget whence-alist whence)))
+       (if (not position) (input-tell input)
+           (begin (input-seek input position whence)
+                  (input-tell input)))))
+ #+end_src
+
+**** Test it out
+ #+begin_src gerbil
+   (import :drewc/gsf/test/find-member
+           :drewc/gsf/test/open-archive
+           :drewc/gsf/test/iconv
+           :drewc/gsf/test/ms-oxprop-db
+           :drewc/gsf/test/list-children
+           :drewc/gsf/test/substg-string
+           :drewc/gsf/test/u8vector
+           :drewc/gsf/test/input-to-string
+           :std/test
+
+           :std/srfi/13
+           :std/text/utf16
+           )
+
+   (def msg (open-archive "/home/user/src/gerbil-gsf/test/Outlook1.msg"))
+
+   (def body (find-member msg "__substg1.0_1000001F"))
+
+   (check (input-size body) => 6056)
+
+   (def body-string (substg->string body))
+
+   (check (string-length body-string) => 2952)
+   (check (substring body-string 0 10) => "Thank you!")
+
+   (def (test-read-utf16le-string (inp body) (str "Thank you!"))
+     (def p (open-output-u8vector))
+
+     (read-bytes-from-input inp (* 2 (string-length str)) p)
+
+     (let* ((new8 (get-output-u8vector p))
+            (new-str (utf16->string new8 'little)))
+       (check new-str => str)))
+
+   (def (test-read-utf16le-GsfInput (inp body) (str body-string))
+     (input-byte-position inp 0)
+     (let* ((p (open-output-u8vector))
+            (go (cut read-bytes-from-input inp 1024 p))
+            (u8 (let lp ((n (go)))
+                  (if (zero? n) (get-output-u8vector p) (lp (go)))))
+            (new-str (string-delete (cut char=? <> #\return)
+                                    (utf16->string u8 'little))))
+       (check new-str => str)))
+
+
+
+
+
+
+
+
+   (def attachment (find-member msg "__attach_version1.0_#00000000"))
+
+   ;; ("__substg1.0_37010102" . #<ms-oxprop #130 name: PidTagAttachDataBinary
+   ;; id: "0x3701" type: PtypBinary type-id: "0x0102" area: "Message Attachment
+   ;; Properties">)
+   (def attachment-binary (find-member attachment "__substg1.0_37010102"))
+   ;; (def body-rtf (find-member msg "__substg1.0_10090102"))
+
+   ;; (check (ms-oxprop-name (input-ms-oxprop body-rtf))
+   ;;        => 'PidTagRtfCompressed)
+   ;; (check (ms-oxprop-type (input-ms-oxprop body-rtf))
+   ;;        => 'PtypBinary)
+
+   ;; All raw byte sequences are encoded by a length value followed by the specified
+   ;; number of bytes. The length value is encoded as a PtypInteger32 ([MS-OXCDATA]
+   ;; section 2.11.1) as shown in section 2.9.6.1. For example, the byte sequence 0x22
+   ;; 0xF8 0xFF 0x00 0x22 would be encoded as 0x05 0x22 0xF8 0xFF 0x00 0x22. A zero
+   ;; length PtypBinary ([MS-OXCDATA] section 2.11.1) value MUST NOT be encoded, but
+   ;; MUST be marked as not present in the presenceBitArray.
+
+   ;; (def (bytes->integer bytes)
+   ;;   (let lp ((i 0) (r 0))
+   ;;     (if (fx< i (u8vector-length bytes))
+   ;;       (let (b (u8vector-ref bytes i))
+   ;;         (lp (fx1+ i) (bitwise-ior (arithmetic-shift r 8) b)))
+   ;;       r)))
+
+   ;; (def (integer->bytes x)
+   ;;   (let lp ((x x) (r []))
+   ;;     (if (positive? x)
+   ;;       (lp (arithmetic-shift x -8)
+   ;;           (cons (bitwise-and x #xff) r))
+   ;;       (list->u8vector r))))
+ #+end_src
+
+**** /File/ ~test/u8vector.ss~
+ #+begin_src gerbil :tangle test/u8vector.ss :noweb yes
+   (import (for-syntax :drewc/gsf/glib) :std/foreign
+           :drewc/gsf/glib :std/srfi/13)
+   (export read-bytes-from-input input-tell input-seek input-byte-position)
+
+   (begin-glib-ffi (read-bytes-from-input input-tell input-seek G_SEEK_SET G_SEEK_CURR G_SEEK_END)
+
+     (c-declare #<<END-C
+
+
+   #include <gsf/gsf.h>
+   #include <glib/gi18n.h>
+   #include <glib/gstdio.h>
+   #include <gio/gio.h>
+   #include <locale.h>
+   #include <string.h>
+   #include <errno.h>
+
+
+   END-C
+   )
+
+     <<open-archive-objects>>
+     <<write_u8>>
+
+     (c-declare #<<END-C
+      <<scm_read_bytes_from_input>>
+
+   END-C
+   )
+     <<input-tell-and-seek>>
+
+     <<read-bytes-from-input>>)
+
+
+   <<input-byte-position>>
+
+ #+end_src
+
+*** Read attachment ~GsfInput*~ to a file.
+
+ I'm fairly certain that when this is done I can go to intermission and get a
+ byte to eat.
+
+ So, it turns out that properties are not actually stored in *streams*, which
+ are actually files with names, but rather in a ~__properties_version1.0~
+ *stream*
+
+ Yet, "Each variable length property has an entry in the property stream.
+ However, the entry contains only the property tag, a flag providing more
+ information about the property, the size, and a reserved field. The entry does
+ not contain the variable length property's value. Since the value can be
+ variable in length, it is stored in an individual stream by
+ itself."[fn:ms-oxmsg-var-props], so my initial thoughts are not that far off.
+
+ So, apparently ~"__substg1.0_3707001F"~ is ~PidTagAttachLongFilename~.
+
+*** Test
+ #+begin_src gerbil
+   (import :drewc/gsf/test/find-member
+           :drewc/gsf/test/open-archive
+           :drewc/gsf/test/iconv
+           :drewc/gsf/test/ms-oxprop-db
+           :drewc/gsf/test/list-children
+           :drewc/gsf/test/substg-string
+           :drewc/gsf/test/u8vector
+           :drewc/gsf/test/input-to-string
+           :std/test
+
+           :std/srfi/13
+           :std/text/utf16
+           )
+
+   (def msg (open-archive "/home/user/src/gerbil-gsf/test/Outlook1.msg"))
+
+
+   (def attachment (find-member msg "__attach_version1.0_#00000000"))
+
+   ;; ("__substg1.0_3707001F" .
+   ;;  #<ms-oxprop #82
+   ;;  name: PidTagAttachLongFilename id: "0x3707" type: PtypString
+   ;;  type-id: "0x001F" area: "Message Attachment Properties">)
+
+   (def attachment-filename-input-name  "__substg1.0_3707001F")
+   (def attachment-filename-input (find-member attachment "__substg1.0_3707001F"))
+   (def attachment-filename (substg->string attachment-filename-input))
+
+   ;; ("__substg1.0_37010102" . #<ms-oxprop #130 name: PidTagAttachDataBinary
+   ;; id: "0x3701" type: PtypBinary type-id: "0x0102" area: "Message Attachment
+   ;; Properties">)
+
+   (def attachment-binary-input-name "__substg1.0_37010102")
+   (def attachment-binary (find-member attachment "__substg1.0_37010102"))
+
+   (check (ms-oxprop-name (input-ms-oxprop attachment-binary))
+          => 'PidTagAttachDataBinary)
+   (check (ms-oxprop-type (input-ms-oxprop attachment-binary))
+         => 'PtypBinary)
+
+   (def (attachment->file (attachment attachment)
+                          dir: (dir "/home/user/src/gerbil-gsf/test"))
+     (let* ((fn (substg->string
+                 (find-member attachment attachment-filename-input-name)))
+            (bin (find-member attachment attachment-binary-input-name))
+            (get (cut read-bytes-from-input bin 1024 <>))
+            (path (path-expand fn dir)))
+       (input-byte-position bin 0)
+       (call-with-output-file
+        path
+        (lambda (port)
+          (let lp ((bytes (get port)))
+            (if (zero? bytes) path (lp (get port))))))))
+
+   (def attachment-filesystem-path (attachment->file attachment))
+
+   ;; ("__substg1.0_370E001F" . #<ms-oxprop #83 name: PidTagAttachMimeTag
+   ;; id: "0x370E" type: PtypString type-id: "0x001F"
+   ;; area: "Message Attachment Properties">)
+
+
+   (def (file-mime-type path)
+     (string-trim-right
+      (cdr (shell-command
+            (string-append "file -b0 --mime-type " path) #t))
+      #\newline))
+
+   (def attachment-file-mime-type
+     (file-mime-type attachment-filesystem-path))
+
+
+   (def attachment-mime-input-name "__substg1.0_370E001F")
+   (def attachment-mime-type (substg->string (find-member attachment attachment-mime-input-name)))
+
+   (check attachment-file-mime-type => attachment-mime-type)
+
+
+
+
+
+
+
+
+
+
+
+   ;; All raw byte sequences are encoded by a length value followed by the specified
+   ;; number of bytes. The length value is encoded as a PtypInteger32 ([MS-OXCDATA]
+   ;; section 2.11.1) as shown in section 2.9.6.1. For example, the byte sequence 0x22
+   ;; 0xF8 0xFF 0x00 0x22 would be encoded as 0x05 0x22 0xF8 0xFF 0x00 0x22. A zero
+   ;; length PtypBinary ([MS-OXCDATA] section 2.11.1) value MUST NOT be encoded, but
+   ;; MUST be marked as not present in the presenceBitArray.
+
+   ;; (def (bytes->integer bytes)
+   ;;    (let lp ((i 0) (r 0))
+   ;;    (if (fx< i (u8vector-length bytes))
+   ;;        (let (b (u8vector-ref bytes i))
+   ;;          (lp (fx1+ i) (bitwise-ior (arithmetic-shift r 8) b)))
+   ;;        r)))
+
+   ;; (def (integer->bytes x)
+   ;;   (let lp ((x x) (r []))
+   ;;     (if (positive? x)
+   ;;       (lp (arithmetic-shift x -8)
+   ;;           (cons (bitwise-and x #xff) r))
+   ;;       (list->u8vector r))))
+ #+end_src
+    
+**** /File/ ~test/attachment.ss~
+ #+begin_src gerbil :tangle test/u8vector.ss :noweb yes
+   (import (for-syntax :drewc/gsf/glib) :std/foreign
+           :drewc/gsf/glib :std/srfi/13)
+   (export read-bytes-from-input input-tell input-seek input-byte-position)
+
+   (begin-glib-ffi (read-bytes-from-input input-tell input-seek G_SEEK_SET G_SEEK_CURR G_SEEK_END)
+
+     (c-declare #<<END-C
+
+
+   #include <gsf/gsf.h>
+   #include <glib/gi18n.h>
+   #include <glib/gstdio.h>
+   #include <gio/gio.h>
+   #include <locale.h>
+   #include <string.h>
+   #include <errno.h>
+
+
+   END-C
+   )
+
+     <<open-archive-objects>>
+     <<write_u8>>
+
+     (c-declare #<<END-C
+      <<scm_read_bytes_from_input>>
+
+   END-C
+   )
+     <<input-tell-and-seek>>
+
+     <<read-bytes-from-input>>)
+
+
+   <<input-byte-position>>
+
+ #+end_src
 
 ** /File ~gsf.c~
    :PROPERTIES:
@@ -1407,6 +2155,74 @@ gsf                            29 November 2009                         GSF(1)
 #+end_src
 
 
+** ~man gsf~
+
+#+begin_src shell :results output
+man gsf
+#+end_src
+
+#+begin_example
+GSF(1)                               GNOME                              GSF(1)
+
+NAME
+       gsf - archiving utility using the G Structured File library
+
+SYNOPSIS
+       gsf [OPTION...] SUBCOMMAND ARCHIVE...
+
+DESCRIPTION
+       This manual page briefly documents the gsf command.
+
+       gsf  is  a simple archive utility, somewhat similar to tar(1). It oper‐
+       ates on files following one of the structured file  formats  understood
+       by  the  G  Structured  File  library, for example, Microsoft Excel(TM)
+       files.
+
+OPTIONS
+   Options
+       -?, --help
+              Show help options
+
+       -v, --version
+              Display gsf's version
+
+   Subcommands
+       cat    Output one or more files in archive
+
+       dump   Dump one or more files in archive as formatted hexadecimal
+
+       help   List subcommands
+
+       list   List files in archive
+
+       props  Archive list of property names
+
+EXAMPLES
+       To list the content structure of a Microsoft Excel(TM) file arrays.xls:
+
+       gsf list arrays.xls
+
+       To dump Workbook, an individual data stream in arrays.xls:
+
+       gsf dump arrays.xls Workbook
+
+AUTHORS
+       gsf's primary authors are Morten Welinder  <terra@gnome.org>  and  Jody
+       Goldberg <jody@gnome.org>.
+
+       The  initial version of this manpage was written by J.H.M. Dassen (Ray)
+       <jdassen@debian.org>.
+
+SEE ALSO
+       gnumeric(1)
+
+       The Gnumeric homepage ⟨http://www.gnome.org/projects/gnumeric/⟩
+
+       The GNOME project page ⟨http://www.gnome.org/⟩
+
+gsf                            29 November 2009                         GSF(1)
+#+end_example
+
 ** /File/ ~msg.reader.js~
    :PROPERTIES:
    :CUSTOM_ID: msg_reader_js
@@ -1983,156 +2799,205 @@ gsf                            29 November 2009                         GSF(1)
    :END:
 
  #+begin_src c :tangle test/test-dump-msole.c :mkdir yes
-  /* vim: set sw=8: -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
-  /*
-   ,* test-dump-msole.c: Export a msole file to a directory tree
-   ,*
-   ,* Copyright (C) 2002-2006	Jody Goldberg (jody@gnome.org)
-   ,*
-   ,* This program is free software; you can redistribute it and/or
-   ,* modify it under the terms of version 2.1 of the GNU Lesser General Public
-   ,* License as published by the Free Software Foundation.
-   ,*
-   ,* This program is distributed in the hope that it will be useful,
-   ,* but WITHOUT ANY WARRANTY; without even the implied warranty of
-   ,* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   ,* GNU General Public License for more details.
-   ,*
-   ,* You should have received a copy of the GNU Lesser General Public License
-   ,* along with this program; if not, write to the Free Software
-   ,* Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
-   ,* USA
-   ,*/
+   /* vim: set sw=8: -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
+   /*
+    ,* test-dump-msole.c: Export a msole file to a directory tree
+    ,*
+    ,* Copyright (C) 2002-2006	Jody Goldberg (jody@gnome.org)
+    ,*
+    ,* This program is free software; you can redistribute it and/or
+    ,* modify it under the terms of version 2.1 of the GNU Lesser General Public
+    ,* License as published by the Free Software Foundation.
+    ,*
+    ,* This program is distributed in the hope that it will be useful,
+    ,* but WITHOUT ANY WARRANTY; without even the implied warranty of
+    ,* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    ,* GNU General Public License for more details.
+    ,*
+    ,* You should have received a copy of the GNU Lesser General Public License
+    ,* along with this program; if not, write to the Free Software
+    ,* Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+    ,* USA
+    ,*/
 
-  #include <gsf/gsf-utils.h>
+   #include <gsf/gsf-utils.h>
 
-  #include <gsf/gsf-input-stdio.h>
-  #include <gsf/gsf-infile.h>
-  #include <gsf/gsf-infile-msole.h>
+   #include <gsf/gsf-input-stdio.h>
+   #include <gsf/gsf-infile.h>
+   #include <gsf/gsf-infile-msole.h>
 
-  #include <gsf/gsf-output-stdio.h>
-  #include <gsf/gsf-outfile.h>
-  #include <gsf/gsf-outfile-stdio.h>
+   #include <gsf/gsf-output-stdio.h>
+   #include <gsf/gsf-outfile.h>
+   #include <gsf/gsf-outfile-stdio.h>
 
-  #include <stdio.h>
+   #include <stdio.h>
 
-  static void
-  clone_ (GsfInput *input, GsfOutput *output)
-  {
-    guint8 const *data;
-    size_t len;
-    int i;
+   static void
+   clone_ (GsfInput *input, GsfOutput *output)
+   {
+     guint8 const *data;
+     size_t len;
+     int i;
 
-    if (gsf_input_size (input) > 0) {
-      while ((len = gsf_input_remaining (input)) > 0) {
-        /* copy in odd sized chunks to exercise system */
-        if (len > 314)
-          len = 314;
-        if (NULL == (data = gsf_input_read (input, len, NULL))) {
-          g_warning ("error reading ?");
-          return;
-        }
-        if (!gsf_output_write (output, len, data)) {
-          g_warning ("error writing ?");
-          return;
-        }
-      }
-    }
+     if (gsf_input_size (input) > 0) {
+       while ((len = gsf_input_remaining (input)) > 0) {
+         /* copy in odd sized chunks to exercise system */
+         if (len > 314)
+           len = 314;
+         if (NULL == (data = gsf_input_read (input, len, NULL))) {
+           g_warning ("error reading ?");
+           return;
+         }
+         if (!gsf_output_write (output, len, data)) {
+           g_warning ("error writing ?");
+           return;
+         }
+       }
+     }
 
-    /* See test-cp-msole.c for explanation how to distinct directories
-     ,* from regular files.
-     ,*/
-    if (GSF_IS_INFILE (input) &&
-        gsf_infile_num_children (GSF_INFILE (input)) > 0) {
-      GsfInfile *in = GSF_INFILE (input);
-      GsfOutfile *out = GSF_OUTFILE (output);
-      GsfInput *src;
-      GsfOutput *dst;
-      gboolean is_dir;
+     /* See test-cp-msole.c for explanation how to distinct directories
+      ,* from regular files.
+      ,*/
+     if (GSF_IS_INFILE (input) &&
+         gsf_infile_num_children (GSF_INFILE (input)) > 0) {
+       GsfInfile *in = GSF_INFILE (input);
+       GsfOutfile *out = GSF_OUTFILE (output);
+       GsfInput *src;
+       GsfOutput *dst;
+       gboolean is_dir;
 
-      for (i = 0 ; i < gsf_infile_num_children (in) ; i++) {
-        src = gsf_infile_child_by_index (in, i);
-        is_dir = GSF_IS_INFILE (src) &&
-          gsf_infile_num_children (GSF_INFILE (src)) >= 0;
-        dst = gsf_outfile_new_child  (out,
-          gsf_infile_name_by_index  (in, i),
-          is_dir);
-        clone_ (src, dst);
-      }
-    }
+       for (i = 0 ; i < gsf_infile_num_children (in) ; i++) {
+         src = gsf_infile_child_by_index (in, i);
+         is_dir = GSF_IS_INFILE (src) &&
+           gsf_infile_num_children (GSF_INFILE (src)) >= 0;
+         dst = gsf_outfile_new_child  (out,
+           gsf_infile_name_by_index  (in, i),
+           is_dir);
+         clone_ (src, dst);
+       }
+     }
 
-    gsf_output_close (output);
-    g_object_unref (G_OBJECT (output));
-    g_object_unref (G_OBJECT (input));
-  }
+     gsf_output_close (output);
+     g_object_unref (G_OBJECT (output));
+     g_object_unref (G_OBJECT (input));
+   }
 
-  static int
-  test (char *argv[])
-  {
-    GsfInput   *input;
-    GsfInfile  *infile;
-    GsfOutfile *outfile;
-    GError    *err = NULL;
+   static int
+   test (char *argv[])
+   {
+     GsfInput   *input;
+     GsfInfile  *infile;
+     GsfOutfile *outfile;
+     GError    *err = NULL;
 
-    fprintf (stderr, "%s\n", argv [1]);
-    input = gsf_input_stdio_new (argv[1], &err);
-    if (input == NULL) {
-      g_return_val_if_fail (err != NULL, 1);
+     fprintf (stderr, "%s\n", argv [1]);
+     input = gsf_input_stdio_new (argv[1], &err);
+     if (input == NULL) {
+       g_return_val_if_fail (err != NULL, 1);
 
-      g_warning ("'%s' error: %s", argv[1], err->message);
-      g_error_free (err);
-      return 1;
-    }
+       g_warning ("'%s' error: %s", argv[1], err->message);
+       g_error_free (err);
+       return 1;
+     }
 
-    infile = gsf_infile_msole_new (input, &err);
-    g_object_unref (G_OBJECT (input));
+     infile = gsf_infile_msole_new (input, &err);
+     g_object_unref (G_OBJECT (input));
 
-    if (infile == NULL) {
-      g_return_val_if_fail (err != NULL, 1);
+     if (infile == NULL) {
+       g_return_val_if_fail (err != NULL, 1);
 
-      g_warning ("'%s' Not an OLE file: %s", argv[1], err->message);
-      g_error_free (err);
-      return 1;
-    }
+       g_warning ("'%s' Not an OLE file: %s", argv[1], err->message);
+       g_error_free (err);
+       return 1;
+     }
 
-    outfile = gsf_outfile_stdio_new (argv[2], &err);
-    if (outfile == NULL) {
-      g_return_val_if_fail (err != NULL, 1);
+     outfile = gsf_outfile_stdio_new (argv[2], &err);
+     if (outfile == NULL) {
+       g_return_val_if_fail (err != NULL, 1);
 
-      g_warning ("'%s' error: %s", argv[1], err->message);
-      g_error_free (err);
-      return 1;
-    }
-    clone_ (GSF_INPUT (infile), GSF_OUTPUT (outfile));
+       g_warning ("'%s' error: %s", argv[1], err->message);
+       g_error_free (err);
+       return 1;
+     }
+     clone_ (GSF_INPUT (infile), GSF_OUTPUT (outfile));
 
-    return 0;
-  }
+     return 0;
+   }
 
-  int
-  main (int argc, char *argv[])
-  {
-    int res;
+   int
+   main (int argc, char *argv[])
+   {
+     int res;
 
-    if (argc != 3) {
-      fprintf (stderr, "%s : infile outdir\n", argv [0]);
-      return 1;
-    }
+     if (argc != 3) {
+       fprintf (stderr, "%s : infile outdir\n", argv [0]);
+       return 1;
+     }
 
-    gsf_init ();
-    res = test (argv);
-    gsf_shutdown ();
+     gsf_init ();
+     res = test (argv);
+     gsf_shutdown ();
 
-    return res;
-  }
+     return res;
+   }
 #+end_src
 
+* Intermission
+
+That was a lot of fun. Learned a lot about Outlook files and C and glib and FFI.
+
+Now it needs split off into two libraries: ~gerbil-gsf~ and ~gmsg~. 
+
+I think that ~gerbil-gsf~ and many Gerbil FFI's may be better served by
+c2ffi[fn:c2ffi], but for now it's manually written.
+
+* Act 2: GSF API and Manual (Testing).
+
+Really, the entire library should not be contained in a README.org, which is how
+it currently stands. Moving [[file:api.org::#gsf_glib_object_system][~glib.h~ and ~GObject~: The GLib Object System]] to
+~api.org~ is a good start.
+
+Now, in ~doc/manual.org~ I need to document something, and having tests would be
+nice as well, so I'll document turning a ~.msg~ file into a *JSON* file as
+that's my ultimate aim.
+
+** Scene 1: Storages and Streams
+
+What gsf calls *Input*'s, Microsoft calls *object*'s, divided into *storage*'s
+and *streams*.
+
+Which is what [[file:doc/manual.org::#gsf_storages_and_streams][we'll call them.]] The manual describes them, but this play is for
+the audience, not the code. So, we'll need a test of speed and memory.
+
+
+
+
+
+
+
+
+
+
+
+
+
+* TODO _properties_version1.0
+https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxmsg/f67ea816-c5d7-41de-8e5c-93248d3970d8
 * Footnotes
+
+[fn:c2ffi] https://github.com/rpav/c2ffi
+
+[fn:ms-oxmsg-var-props]  https://docs.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxmsg/08185828-e9e9-4ef2-bcd2-f6e69c00891b
+
+[fn:GsfInfile] https://developer.gnome.org/gsf/1.14/gsf-Infile-reading-structed-files.html
+
+[fn:github-ms-oxprops] https://github.com/Jmcleodfoss/ms-oxprops-db
 
 [fn:gfs_input_read] https://developer.gnome.org/gsf/1.14/gsf-Input-from-unstructured-files.html#gsf-input-read
 
 [fn:gambc-c-lambda]  http://www.iro.umontreal.ca/~gambit/doc/gambit.html#c_002dlambda
 
-[fn:gfs-infile]  https://developer.gnome.org/gsf/1.14/gsf-Infile-reading-structed-files.html#GsfInfile
+[fn:gsf-infile]  https://developer.gnome.org/gsf/1.14/gsf-Infile-reading-structed-files.html#GsfInfile
 
 [fn:rfc-2781]  https://tools.ietf.org/html/rfc2781
 

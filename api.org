@@ -1,0 +1,604 @@
+#+TITLE: Gerbil GSF API Reference
+
+
+* ~glib.h~ and ~GObject~: The GLib Object System
+  :PROPERTIES:
+  :CUSTOM_ID: gsf_glib_object_system
+  :END:
+
+** ~gobj_free~: Our own ~g_object_unref~
+
+ First things first, we'll make a function for the gerbil GC that frees the
+ object when done. It will actually come last.
+
+ #+begin_src c :noweb-ref gobj_free
+ #ifndef ___HAVE_GOBJ_FREE
+ #define ___HAVE_GOBJ_FREE
+ ___SCMOBJ gobj_free (void *ptr)
+ {
+  g_object_unref (ptr);
+  return ___FIX (___NO_ERR);
+ }
+ #endif
+ #+end_src
+
+** ~define-c-GObject~: A prelude macro
+   :PROPERTIES:
+   :CUSTOM_ID: define_c_gobject
+   :END:
+
+
+Now that we have ~gobj_free~ we can make a way to easily define a gerbil
+interface to it.
+
+#+begin_src gerbil :noweb-ref define-c-GObject
+  (define-macro (define-c-GObject name . tags)
+    (let* ((str (symbol->string name))
+           (ptr (string->symbol (string-append str "*")))
+           (ptr-tags (cond ((and (pair? tags) (list? (car tags)))
+                            (cons ptr (map (lambda (t)
+                                        (string->symbol
+                                         (string-append (symbol->string t) "*")))
+                                           (car tags))))
+
+                           ((and (pair? tags) (eq? #f (car tags)))
+                            #f)
+                           (else (list ptr)))))
+
+
+    `(begin (c-define-type ,name ,str)
+            (c-define-type ,ptr (pointer ,str ,ptr-tags "gobj_free")))))
+#+end_src
+
+** /File/ ~glib.ss~
+
+ #+begin_src gerbil :tangle glib.ss :noweb yes
+   (import :std/foreign (for-syntax :std/stxutil))
+   (export begin-glib-ffi)
+   (defsyntax (begin-glib-ffi stx)
+     (def (prelude-macros)
+       '(
+         <<define-c-GType>>
+         <<define-c-GObject>>
+         ))
+     (syntax-case stx ()
+       ((_ exports body ...)
+        (with-syntax (((macros ...) (prelude-macros)))
+          #'(begin-ffi
+             exports
+             macros ...
+             (c-declare "___SCMOBJ gobj_free(void *ptr);")
+             (c-declare "#include <glib.h>")
+             (define-c-GObject GObject #f)
+             (define-const TRUE)
+             (define-const FALSE)
+            body ...
+            (c-declare #<<END-C
+   <<gobj_free>>
+   END-C
+   ))))))
+ #+end_src
+
+
+
+
+* ~gsf.ss~: A toplevel interface
+
+#+begin_src gerbil :tangle gsf.ss
+  package: drewc
+  (import :drewc/gsf/infile :drewc/gsf/input)
+  (export open-compound-file
+          storage? storage-name storage-children-count storage-children storage-ref
+
+         input? input=? input-name input-container
+
+         stream? stream-read-u8 stream-byte-position 
+
+         infile?)
+
+  (def open-compound-file open-infile)
+
+  (def (storage? thing) (and (input? thing) (infile? thing)
+                             (<= 0 (infile-num-children thing))))
+
+  (def storage-name input-name)
+  (def storage-children infile-children)
+
+  (def storage-children-count infile-num-children)
+
+  (def (storage-ref s . refs)
+    (let (child
+          ((if (string? (car refs)) infile-child-by-name infile-child-by-index)
+           s (car refs)))
+      (if (not child) #f
+          (if (null? (cdr refs)) child
+              (apply storage-ref child (cdr refs))))))
+
+  (def (stream? thing)
+    (and (input? thing)
+         (not (storage? thing))))
+
+  (def stream-read-u8 input-read-u8)
+  (def stream-byte-position input-byte-position)
+  (def stream-size input-size)
+  (def write-stream-bytes write-input-bytes)
+
+  (def (stream-read-u8vector strm n: (n 1024) (bytes #u8()))
+    (call-with-output-u8vector
+     bytes (lambda (p) (write-stream-bytes strm n: n p))))
+
+  (def (stream-read-all-as-u8vector strm (buffsize 8192))
+    (let ((givr (cut write-stream-bytes strm n: buffsize <>)))
+      (call-with-output-u8vector
+       #u8() (lambda (p)
+               (let lp ((n (givr p)))
+                 (if (> buffsize n) p
+                     (lp (givr p))))))))
+
+#+end_src
+
+* ~GsfInput~: Reading things
+
+#+begin_src gerbil :noweb-ref gsf-input-object
+    (define-c-GObject GsfInput #f)
+    (define-c-GObject GsfInfile (GsfInput GsfInfile-nonfree))
+    (c-define-type GsfInfile-nonfree* (pointer "GsfInfile"))
+#+end_src
+
+#+begin_src gerbil :noweb-ref input?
+    (define %input? (c-lambda (GsfInput*) bool "GSF_IS_INPUT"))
+    (define (input? thing) (and (foreign? thing) (%input? thing)))
+    (define (input=? x y)
+      (and (input? x) (input? x)
+           (or (= (foreign-address x) (foreign-address y))
+             (and (equal? (input-name x) (input-name y))
+                (input=? (input-container x) (input-container y))))))
+#+end_src
+
+** ~input-read~: The entire reason behind input
+
+There's a C function that does just enough so we can have a reader.
+
+#+begin_quote
+
+~guint8 const * gsf_input_read
+ (GsfInput *input, size_t num_bytes, guint8 *optional_buffer);~
+
+Read at least num_bytes . Does not change the current position if there is an
+error. Will only read if the entire amount can be read. Invalidates the buffer
+associated with previous calls to gsf_input_read.
+
+Parameters
+ - input :: the input stream
+ - num_bytes :: number of bytes to read
+ - optional_buffer :: Pointer to destination memory area.
+
+[array][allow-none]
+
+Returns
+pointer to the buffer or NULL if there is an error or 0 bytes are requested.
+
+[array][nullable]
+#+end_quote
+
+*** ~input-read-u8~
+
+  #+begin_src c :noweb-ref input_read_u8_c
+    int input_read_u8(GsfInput *input) {
+
+        guint8 const *data;
+        int ret;
+        gsf_off_t start_offset, remaining;
+
+        start_offset = gsf_input_tell (input);
+
+        remaining = gsf_input_remaining (input);
+
+        if (remaining == 0) {
+          return -1;
+        }
+        if (NULL == (data = gsf_input_read (input, 1, NULL))) {
+          g_warning("Error reading from input: gsf_input_read = NULL");
+          gsf_input_read (input, 0, NULL);
+          gsf_input_seek (input, start_offset, G_SEEK_SET);
+          return -1;
+        }
+
+        ret = *data;
+        gsf_input_read (input, 0, NULL);
+        return ret;
+    }
+  #+end_src
+
+ #+begin_src gerbil :noweb-ref input_read_u8
+ (define input_read_u8 (c-lambda (GsfInput*) int "input_read_u8"))
+ #+end_src
+
+
+ #+begin_src gerbil :noweb-ref input-read-u8
+   (def (input-read-u8 inp)
+     (let (u8 (input_read_u8 inp)) (if (= -1 u8) (eof-object) u8)))
+ #+end_src
+
+*** ~write-input-bytes~
+
+    Writing bytes from ~GsfInput*~ to a scheme port is what's needed for a lot of
+    things. This is a reader from input and a writer to a port.
+
+    Writing one byte from C is the start.
+
+   #+begin_src gerbil :noweb-ref write_u8
+     (c-define (write-unsigned-int8 int port) (unsigned-int8 scheme-object)
+               void "write_u8" "static"
+      (write-u8 int port)
+      #f)
+   #+end_src
+
+  Now a C function which simply reads a set amount of bytes from the input and
+  writes them to the port. It returns the amount of bytes read and will not go
+  past the remaining input.
+
+ #+begin_src c :noweb-ref write_input_bytes
+   guint64 write_input_bytes(GsfInput *input, size_t n,  ___SCMOBJ port) {
+
+       guint8 const *data;
+       guint64 count = 0;
+       size_t i;
+       gsf_off_t start_offset, remaining;
+
+       start_offset = gsf_input_tell (input);
+       remaining = gsf_input_remaining (input);
+
+       n = (n > remaining) ? remaining : n;
+
+       if (NULL == (data = gsf_input_read (input, n, NULL))) {
+         g_warning("Error reading from input: gsf_input_read = NULL");
+         gsf_input_read (input, 0, NULL);
+         gsf_input_seek (input, start_offset, G_SEEK_SET);
+         return 0;
+       }
+
+       for (i = 0; i < n; ++i) {
+         write_u8(*(data + i), port);
+         ++count;
+       }
+
+       gsf_input_read (input, 0, NULL);
+       return count;
+   }
+ #+end_src
+
+ A scheme wrapper for that function.
+
+ #+begin_src gerbil :noweb-ref define_write_input_bytes
+   (define write_input_bytes
+     (c-lambda (GsfInput* size_t scheme-object) unsigned-int64
+               "write_input_bytes"))
+ #+end_src
+
+ And a Gerbil definition that takes care of the defaults.
+
+#+begin_src gerbil :noweb-ref write-input-bytes
+  (def (write-input-bytes inp n: (n 1024) (port (current-output-port)))
+    (write_input_bytes inp n port))
+#+end_src
+
+
+** ~input-byte-position~
+ 
+#+begin_src gerbil :noweb-ref input-tell-and-seek
+   (define input-tell (c-lambda (GsfInput*) unsigned-int64 "gsf_input_tell"))
+
+   (define input-seek
+     (c-lambda (GsfInput* int int) bool
+               "gsf_input_seek"))
+
+   ;; https://developer.gnome.org/glib/2.62/glib-IO-Channels.html#GSeekType
+   ;; enum GSeekType
+   ;; An enumeration specifying the base position for a g_io_channel_seek_position() operation.
+
+   ;; Members
+   ;; G_SEEK_CUR the current position in the file.
+   ;; G_SEEK_SET the start of the file.
+   ;; G_SEEK_END the end of the file.
+
+   (define-const G_SEEK_CUR)
+   (define-const G_SEEK_SET)
+   (define-const G_SEEK_END)
+ #+end_src
+
+
+#+begin_src gerbil :noweb-ref input-byte-position
+
+        ;; When called with a single argument these procedures return the byte position
+        ;; where the next I/O operation would take place in the file attached to the
+        ;; given port (relative to the beginning of the file).
+
+        ;; When called with two or three arguments, the byte position for subsequent I/O
+        ;; operations on the given port is changed to position, which must be an exact
+        ;; integer.
+
+        ;; When whence is omitted or is 0, the position is relative to the beginning of
+        ;; the file.
+
+        ;; When whence is 1, the position is relative to the current byte position of
+        ;; the file.
+
+        ;; When whence is 2, the position is relative to the end of the file. The return
+        ;; value is the new byte position.
+
+        ;; On most operating systems the byte position for reading and writing of a
+        ;; given bidirectional port are the same. -
+
+        ;; --http://www.iro.umontreal.ca/~gambit/doc/gambit.html#I_002fO-and-ports
+
+        (def (input-byte-position input (position #f) (whence #f))
+
+          (if (not position) (input-tell input)
+              (let* ((whence-alist `((0 . ,G_SEEK_SET)
+                                     (1 . ,G_SEEK_CUR)
+                                     (2 . ,G_SEEK_END)))
+                     (new-whence (if (not whence) G_SEEK_SET (assget whence whence-alist))))
+                (when (not new-whence)
+                  (error "No Whence? " whence-alist
+                         " new whence " new-whence
+                         " old whence " whence))
+                (begin (input-seek input position new-whence)
+                       (input-tell input)))))
+#+end_src
+
+** ~input-name~
+
+#+begin_src gerbil :noweb-ref input-name
+(define input-name (c-lambda (GsfInput*) char-string "___return((char *) gsf_input_name (___arg1));"))
+#+end_src
+The name of the input stream.
+
+Parameters
+ - input :: the input stream
+
+Returns
+input 's name in utf8 form, or #f if it has no name.
+
+[transfer none]
+** ~input-container~
+
+#+begin_src gerbil :noweb-ref input-container
+(define input-container (c-lambda (GsfInput*) GsfInfile-nonfree* "gsf_input_container"))
+#+end_src
+
+Returns
+input 's container.
+
+[transfer none][nullable]
+
+** ~input-size~
+
+#+begin_src gerbil :noweb-ref input-size
+  (define input-size (c-lambda (GsfInput*) size_t "gsf_input_size"))
+#+end_src
+
+the total number of bytes in the input or -1 on error
+
+
+** /File/ ~input.ss~
+
+ #+begin_src gerbil :noweb yes :tangle input.ss
+   (import (for-syntax :drewc/gsf/glib) :std/foreign :drewc/gsf/glib)
+   (export input? input=? input-name input-container input-size
+           input-read-u8 input-tell input-seek write-input-bytes
+           G_SEEK_SET G_SEEK_CUR G_SEEK_END input-byte-position)
+
+   (begin-glib-ffi (input? input=? input-name
+                           input-container input-size
+                           input_read_u8 input-tell input-seek
+                           G_SEEK_SET G_SEEK_CUR G_SEEK_END write_input_bytes)
+
+     (c-declare #<<END-C
+
+   #include <gsf/gsf.h>
+   #include <glib/gi18n.h>
+   #include <glib/gstdio.h>
+   #include <gio/gio.h>
+   #include <locale.h>
+   #include <string.h>
+   #include <errno.h>
+
+   <<input_read_u8_c>>
+   END-C
+   )
+     <<write_u8>>
+     (c-declare #<<END-C
+   <<write_input_bytes>>
+   END-C
+   )
+     <<gsf-input-object>>
+     <<input?>>
+     <<input-name>>
+     <<input-container>>
+     <<input-size>>
+     <<input_read_u8>>
+     <<input-tell-and-seek>>
+     <<define_write_input_bytes>>)
+
+   <<input-read-u8>>
+   <<input-byte-position>>
+   <<write-input-bytes>>
+
+ #+end_src
+
+
+** ~GsfInfile~: reading structed files
+
+A compound file is a structure that is used to store a hierarchy of storage
+objects and stream objects into a single file or memory buffer.
+
+#+begin_src gerbil :noweb-ref gsf-infile-objects
+    (define-c-GObject GsfInput #f)
+    (define-c-GObject GsfInfile (GsfInput))
+#+end_src
+
+*** ~(infile? obj)~
+
+ #+begin_src gerbil :noweb-ref infile?
+  (define infile? (c-lambda (GsfInput*) bool "GSF_IS_INFILE"))
+ #+end_src
+
+*** ~(open-infile path)~
+
+ Takes a path and returns an open file or #f if it cannot open it.
+
+ #+begin_src gerbil :noweb-ref open-infile
+  (define open-infile (c-lambda (char-string) GsfInfile* "open_infile"))
+ #+end_src
+
+**** /C Function/ ~open_infile~
+  #+begin_src c :noweb-ref open_infile_c
+  static GsfInfile *
+  open_infile (char const *filename)
+  {
+    GsfInfile *infile;
+    GError *error = NULL;
+    GsfInput *src;
+    char *display_name;
+
+    src = gsf_input_stdio_new (filename, &error);
+    if (error) {
+      display_name = g_filename_display_name (filename);
+      g_printerr (_("%s: Failed to open %s: %s\n"),
+            g_get_prgname (),
+            display_name,
+            error->message);
+      g_free (display_name);
+      return NULL;
+    }
+
+    infile = gsf_infile_msole_new (src, NULL);
+    if (infile) {
+      g_object_unref (src);
+      return infile;
+    }
+
+    infile = gsf_infile_zip_new (src, NULL);
+    if (infile) {
+      g_object_unref (src);
+      return infile;
+    }
+
+    infile = gsf_infile_tar_new (src, NULL);
+    if (infile) {
+      g_object_unref (src);
+      return infile;
+    }
+
+    display_name = g_filename_display_name (filename);
+    g_printerr (_("%s: Failed to recognize %s as an archive\n"),
+          g_get_prgname (),
+          display_name);
+    g_free (display_name);
+
+    g_object_unref (src);
+    return NULL;
+  }
+  #+end_src
+
+*** ~infile-num-children~
+
+The number of children the storage has, or -1 if the storage can not have
+children.
+
+#+begin_src gerbil :noweb-ref infile-num-children
+  (define infile-num-children
+    (c-lambda (GsfInfile*) int "gsf_infile_num_children"))
+#+end_src
+
+*** ~infile-child-by-name~
+
+#+begin_src gerbil :noweb-ref infile-child-by-name
+  (define infile-child-by-name (c-lambda (GsfInfile* char-string) GsfInput* "gsf_infile_child_by_name"))
+#+end_src
+
+*** ~infile-child-by-index~
+
+#+begin_src gerbil :noweb-ref infile-child-by-index
+  (define infile-child-by-index
+    (c-lambda (GsfInfile* int) GsfInput* "gsf_infile_child_by_index"))
+#+end_src
+
+*** ~infile-children~
+
+   Returns a list of children.
+
+#+begin_src gerbil :noweb-ref infile-children
+  (def (infile-children inf)
+    (let (num (infile-num-children inf))
+      (cond ((= num -1) #f)
+            ((= num 0) [])
+            (else
+             (let infc ((n 0))
+               (cons (infile-child-by-index inf n)
+                     (if (= (1- num) n) []
+                         (infc (+ 1 n)))))))))
+#+end_src
+*** /File/ ~infile.ss~
+    :PROPERTIES:
+    :CUSTOM_ID: gsf_infile_ss
+    :END:
+
+ #+begin_src gerbil :noweb yes :tangle infile.ss
+       (import (for-syntax :drewc/gsf/glib) :std/foreign :drewc/gsf/glib)
+       (export open-infile infile?
+               infile-num-children
+               infile-child-by-name
+               infile-child-by-index
+               infile-children)
+
+       (begin-glib-ffi (open-infile infile? infile-num-children infile-child-by-name 
+                                    infile-child-by-index)
+
+         (c-declare #<<END-C
+
+       #include <gsf/gsf.h>
+       #include <glib/gi18n.h>
+       #include <glib/gstdio.h>
+       #include <gio/gio.h>
+       #include <locale.h>
+       #include <string.h>
+       #include <errno.h>
+
+       <<open_infile_c>>
+       END-C
+       )
+         <<gsf-infile-objects>>
+         <<open-infile>>
+         <<infile?>>
+         <<infile-num-children>>
+         <<infile-child-by-index>>
+         <<infile-child-by-name>>)
+
+       <<infile-children>>
+ #+end_src
+
+
+
+  #+begin_src shell :session build
+  gxc  -cc-options "`pkg-config --cflags libgsf-1`"\
+       -ld-options "`pkg-config --libs libgsf-1`"\
+   test/open-archive.ss
+  #+end_src
+
+  #+RESULTS:
+
+
+
+
+
+** Object Hierarchy
+    GObject
+     - GsfInput
+        - GsfInfile
+           - GsfInfileMSOle
+            - GsfInfileStdio
+            - GsfInfileTar
+            - GsfInfileZip
+            - GsfStructuredBlob

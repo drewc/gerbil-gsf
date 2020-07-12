@@ -17,25 +17,29 @@
 static char *
   __GsfInput_to_string (GsfInput *input)
   {
-    guint8 const *data;
+    guint8  const *data;
     size_t len;
     GString *str;
+    char *ret;
 
-   len = gsf_input_size (input);
+    len = gsf_input_size (input);
 
     if (NULL == (data = gsf_input_read (input, len, NULL))) {
       g_warning ("error reading ?");
       return;
     }
+    gsf_input_seek (input, 0, G_SEEK_SET); 
 
     str = g_string_new_len (data, len);
 
-    g_object_unref (G_OBJECT (input));
+    ret = str->str;
 
-    return g_string_free(str, FALSE);
+    g_string_free(str, FALSE);
+
+    return ret;
   }
 END-C
 )
 (define-c-GObject GsfInput (GsfInfile))
-(define-c-GObject GsfInfile)
+(define-c-GObject GsfInfile (GsfInput))
 (define input->string (c-lambda (GsfInput*) UTF-16-string "__GsfInput_to_string")))
