@@ -122,18 +122,37 @@ interface to it.
   (def stream-byte-position input-byte-position)
   (def stream-size input-size)
   (def write-stream-bytes write-input-bytes)
+  (def (copy-stream-to-port strm prt (buffsize 8192))
+    (let ((givr (cut write-stream-bytes strm n: buffsize prt))
+          (total 0))
+      (let lp ((n (givr)))
+        (set! total (+ n total))
+        (if (> buffsize n) total
+            (lp (givr))))))
+
 
   (def (stream-read-u8vector strm n: (n 1024) (bytes #u8()))
     (call-with-output-u8vector
      bytes (lambda (p) (write-stream-bytes strm n: n p))))
 
   (def (stream-read-all-as-u8vector strm (buffsize 8192))
-    (let ((givr (cut write-stream-bytes strm n: buffsize <>)))
-      (call-with-output-u8vector
-       #u8() (lambda (p)
-               (let lp ((n (givr p)))
-                 (if (> buffsize n) p
-                     (lp (givr p))))))))
+    (call-with-output-u8vector
+     #u8() (cut copy-stream-to-port strm <> buffsize)))
+
+  (def (stream-read-string strm n-bytes: (n 1024) (u8-or-settings #u8()))
+    (let (p (open-u8vector u8-or-settings))
+      (write-stream-bytes strm n: n p)
+      (close-output-port p)
+      (read-all-as-string p)))
+
+  (def (stream-read-all-as-string strm buffsize: (n 8192) (u8-or-settings #u8()))
+    (let* ((p (open-u8vector u8-or-settings))
+         (co
+        (if (> n bs) (begin (close-output-port p) (read-all-as-string p))
+            (lp (givr))))))
+
+
+
 
 #+end_src
 

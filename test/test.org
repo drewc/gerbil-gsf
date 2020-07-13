@@ -1,0 +1,15 @@
+#+begin_src gerbil :shebang "#!/usr/bin/env gxi" :tangle "../run-tests.ss" :comments noweb
+  (import :std/test)
+  (def repo-path (path-directory (this-source-file)))
+  (def testdir-path (path-expand "test/" repo-path))
+
+  (load (path-expand "doc/test-manual.ss" repo-path))
+
+  (current-directory testdir-path)
+  (set! test-gsf-root-path testdir-path)
+
+  (run-test-suite! test-gsf-manual)
+
+
+
+#+end_src

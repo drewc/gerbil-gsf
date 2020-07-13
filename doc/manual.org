@@ -36,7 +36,7 @@ objects and stream objects into a single file or memory buffer."
 
 #+begin_src gerbil :noweb-ref test-open-msg
   (def msg (open-compound-file
-            "/home/user/src/gerbil-gsf/test/Outlook1.msg"))
+            (path-expand "Outlook1.msg" test-gsf-root-path)))
 #+end_src
 
 All files, storages and streams are ~input?~'s.
@@ -333,14 +333,280 @@ Like ~write-stream-bytes~ it takes a ~n:~ keyword with the default at *1024*.
   (check msg-subject-first-byte-u8vector => msg-subject-first-byte-u8)
 #+end_src
 
+But if we want to read the whole thing, there is ~stream-read-all-as-u8vector~.
+
+#+begin_src gerbil
+  (def msg-subject-all-as-u8vector
+    (begin (stream-byte-position msg-subject 0)
+           (stream-read-all-as-u8vector msg-subject)))
+
+  (check msg-subject-all-as-u8vector =>  msg-subject-stream-u8vector)
+#+end_src
+
+** ~stream-read-[all-as]-string~: shorthand again, with encoding!
+
+While having an array of bytes is a good thing for many streams, they often
+represent strings. ~stream-read-string~ does that step for us.
 
 
+#+begin_src gerbil
+  (def msg-subject-stream-char-string
+    (begin (stream-byte-position msg-subject 0)
+           (stream-read-string msg-subject)))
+
+  (check msg-subject-stream-char-string
+         => (bytes->string msg-subject-stream-u8vector))
+#+end_src
+
+Somewhat Like ~write-stream-bytes~ it takes a ~n-bytes:~ keyword with the default at *1024*.
+
+#+begin_src gerbil
+  (def msg-subject-first-byte-string
+    (begin (stream-byte-position msg-subject 0)
+           (stream-read-string msg-subject n-bytes: 1)))
+
+  (check msg-subject-first-byte-string
+         => (bytes->string msg-subject-first-byte-u8))
+#+end_src
+
+The reason it's called ~n-bytes~ is that the length of the string may be
+different from the length of the bytes read due to the encoding of characters.
+
+This matters quite a bit! Look at the existing string. The first byte reads as a
+normal string.
+
+#+begin_src gerbil
+  (check msg-subject-first-byte-string => "[")
+#+end_src
+
+But, the entire string is odd. It seems to have null characters in it.
+
+#+begin_src gerbil
+  (check msg-subject-stream-char-string
+         => "[\x0;E\x0;X\x0;T\x0;]\x0; \x0;R\x0;e\x0;:\x0; \x0;[\x0;E\x0;X\x0;T\x0;]\x0; \x0;R\x0;e\x0;:\x0; \x0;O\x0;u\x0;t\x0;l\x0;o\x0;o\x0;k\x0; \x0;.\x0;m\x0;s\x0;g\x0; \x0;f\x0;i\x0;l\x0;e\x0;s\x0;")
+#+end_src
+
+Let us remove them.
+
+#+begin_src gerbil
+  (check (string-delete #\null msg-subject-stream-char-string)
+         => "[EXT] Re: [EXT] Re: Outlook .msg files")
+#+end_src
+
+Gasp! That looks like a proper subject for an outlook .msg file. That's because
+the encoding of that stream is UTF16LE! The name for the subject is
+~"__substg1.0_0037001F"~. The last four characters say what it is.
+
+#+begin_quote
+PtypString 0x001F, %x1F.00
+
+Variable size; a string of Unicode characters in UTF-16LE format encoding with
+terminating null character (0x0000).
+
+PT_UNICODE, string
+#+end_quote
+
+Gambit/Gerbil have a bunch of [[http://www.iro.umontreal.ca/~gambit/doc/gambit.html#Byte_002dport-settings][Byte Port Settings]].
+
+Our ~stream-read-string~ can take them and make a UTF16LE string!
+
+#+begin_src gerbil
+  (def msg-subject-stream-utf16le-string
+    (begin (stream-byte-position msg-subject 0)
+           (stream-read-string msg-subject [char-encoding: 'UTF-16LE])))
+
+  (check msg-subject-stream-utf16le-string
+         => "[EXT] Re: [EXT] Re: Outlook .msg files")
+#+end_src
+
+Which is also the reason it's called ~n-bytes:~, as there are two bytes per char.
+
+There is a ~stream-read-all-as-string~ to read the whole string into memory.
+
+#+begin_src gerbil
+  (check (begin (stream-byte-position msg-subject 0)
+         (stream-read-all-as-string msg-subject [char-encoding: 'UTF-16LE]))
+     => msg-subject-stream-utf16le-string)
+#+end_src
+
+*** Line endings: ~[input-|output-]eol-encoding:~
+
+Like all strings, not only do we have to deal with the encoding:
+  - ~"1" = (49)~ or ~"1" = (49 0)~
+
+But, also, how the end of line is encoded varies. Even better is the character
+~#\newline~, which is the EOL, may be only half of new newline that's input.
+
+#+begin_src gerbil
+  (check (let (encs '(lf cr cr-lf))
+            (map (lambda (e) (with-output-to-u8vector
+                              [eol-encoding: e] (cut write-char #\newline)))
+                 encs))
+    => '(#u8(10) #u8(13) #u8(13 10)))
+#+end_src
+
+ The body of the message has ~CRLF~ as the newline. This is what DOS and Windows
+ use. Two characters is better than one, especially with small RAM and disk
+ space, right?
+
+#+begin_src gerbil
+  (def msg-body (storage-ref msg "__substg1.0_1000001F"))
+
+  (def msg-body-u8vector (stream-read-all-as-u8vector msg-body))
+  (def msg-body-u8vector->string (utf16->string msg-body-u8vector 'little))
+
+  (check (u8vector-length msg-body-u8vector) => 6056)
+  (check (string-length msg-body-u8vector->string) => (/ 6056 2))
+
+  (def msg-body-u8vector->string-return-count
+    (string-count msg-body-u8vector->string #\return))
+
+  (check msg-body-u8vector->string-return-count => 76)
+#+end_src
+
+Now, as luck would have it, for some unknown reason our current string reader
+seems to do it the right way automagically.
+
+#+begin_src gerbil
+  (def msg-body-all-as-string (begin (stream-byte-position msg-body 0)
+                                     (stream-read-all-as-string
+                                      msg-body [char-encoding: 'UTF-16LE])))
+
+  (check-predicate (string-count msg-body-all-as-string #\return) zero?)
+#+end_src
+
+Since I like to know the reasons, it seems to be as follows.
+
+#+begin_quote
+- cr-lf :: For an output-port, writing a #\newline character outputs to the
+           stream a #\return character followed by a #\linefeed character. For
+           an input-port, a #\newline character is read when a #\linefeed
+           character or a #\return character is encountered on the stream.
+           Moreover, if this character is immediately followed by the opposite
+           character (#\linefeed followed by #\return or #\return followed by
+           #\linefeed) then the second character is ignored.
+
+           In other words, all four possible end-of-line encodings are read as a
+           single #\newline character.
+
+           Text files created by DOS and Microsoft Windows applications
+           typically use this end-of-line encoding.
+#+end_quote
+
+Awesome! Just to make sure, We'll futz with it.
+
+#+begin_src gerbil
+  ;; First things first, a #\newline is also, by default here and now, a
+  ;; #\linefeed
+
+  (check (char=? #\linefeed #\newline) => #t)
+
+
+  (def msg-body-all-as-string-crlf (begin (stream-byte-position msg-body 0)
+                                     (stream-read-all-as-string
+                                      msg-body [char-encoding: 'UTF-16LE
+                                                eol-encoding: 'cr-lf])))
+
+  (check-predicate (string-count msg-body-all-as-string-crlf #\return) zero?)
+  (check (string-count msg-body-all-as-string-crlf #\linefeed) => 76)
+
+  (def msg-body-all-as-string-lf (begin (stream-byte-position msg-body 0)
+                                     (stream-read-all-as-string
+                                      msg-body [char-encoding: 'UTF-16LE
+                                                eol-encoding: 'lf])))
+
+
+  (check (string-count msg-body-all-as-string-lf #\return) => 76)
+  (check (string-count msg-body-all-as-string-lf #\linefeed) => 76)
+
+  (def msg-body-all-as-string-cr (begin (stream-byte-position msg-body 0)
+                                     (stream-read-all-as-string
+                                      msg-body [char-encoding: 'UTF-16LE
+                                                               eol-encoding: 'cr])))
+
+  (check (string-count msg-body-all-as-string-cr #\return) => 0)
+  (check (string-count msg-body-all-as-string-cr #\linefeed) => (* 76 2))
+#+end_src
+
+That makes sense, and very happy it is taken care of.
+
+** ~copy-stream-to-port~
+
+It ~-all-~ comes down to this function for the ~-all-~'s. We can even recreate them.
+
+#+begin_src gerbil
+  (def msg-body-copy-u8
+    (begin (stream-byte-position msg-body 0)
+           (call-with-output-u8vector
+            #u8() (cut copy-stream-to-port msg-body <>))))
+
+  (check (equal? msg-body-copy-u8 msg-body-u8vector) => #t)
+
+  (def msg-body-copy-string
+    (let (p (open-u8vector [char-encoding: 'UTF-16LE]))
+      (stream-byte-position msg-body 0)
+      (copy-stream-to-port msg-body p)
+      (close-output-port p)
+      (read-all-as-string p)))
+
+  (check (equal? msg-body-all-as-string msg-body-all-as-string) => #t)
+#+end_src
+
+But the main reason for making a copy to a port is to avoid reading an entire
+stream into memory. And the primary reason I do that is for attachments.
+
+
+#+begin_src gerbil
+  (def msg-attachment (storage-ref msg "__attach_version1.0_#00000000"))
+
+
+  (def (msg-attachment-filename att)
+    (stream-read-all-as-string
+     (storage-ref att "__substg1.0_3707001F")
+     [char-encoding: 'UTF-16LE]))
+
+  (check (msg-attachment-filename msg-attachment) => "image001.jpg")
+
+  (def (msg-attachment-binary att) (storage-ref att "__substg1.0_37010102"))
+
+  (check (stream-size (msg-attachment-binary msg-attachment)) => 3669)
+
+
+  (def (msg-attachment-mime-type att)
+    (stream-read-all-as-string
+     (storage-ref att "__substg1.0_370E001F") [char-encoding: 'UTF-16]))
+
+
+  (def (file-mime-type path)
+    (string-trim-right
+     (cdr (shell-command (string-append "file -b0 --mime-type " path) #t))
+     #\newline))
+
+
+  (def (msg-attachment->file (att msg-attachment))
+    ;; => /path/
+    (let (fn (path-expand (msg-attachment-filename att)
+                          test-gsf-root-path))
+      (try (delete-file fn) (catch _ (void)))
+      (begin0 fn
+        (call-with-output-file fn
+          (cut copy-stream-to-port (msg-attachment-binary att) <>)))))
+
+  (def msg-attachment-path (msg-attachment->file msg-attachment))
+
+  (check (file-info-size (file-info msg-attachment-path)) =>
+         (stream-size (msg-attachment-binary msg-attachment)))
+
+  (check (file-mime-type msg-attachment-path) =>
+         (msg-attachment-mime-type msg-attachment))
+
+#+end_src
 
 * Testing
 
 This file also literately defines and documents a test suite for *Gerbil GSF*.
 
-#+begin_src gerbil :noweb-ref all-tests :noweb yes
+#+begin_src gerbil :noweb-ref all-tests :noweb yes :comments noweb
   <<test-open-msg>>
   <<test-cfile-storage>>
   <<test-cfile-children>>
@@ -362,26 +628,29 @@ This file also literately defines and documents a test suite for *Gerbil GSF*.
   <<test-subject-rest-bytes>>
 #+end_src
 
-#+begin_src gerbil :noweb yes
-  (import :std/test :drewc/gsf)
+#+begin_src gerbil :noweb yes :tangle "test-manual.ss"
+    (import :std/test :drewc/gsf :std/srfi/13 :std/text/utf16 :std/sugar)
+    ;; (export test-gsf-manual test-gsf-root-path)
+    (def test-gsf-root-path  "/home/user/src/gerbil-gsf/test")
 
-  (def test-gsf-manual
-    (test-suite
-     "Testing GSF Manual"
-    <<all-tests>>))
+    (def test-gsf-manual
+      (test-suite
+       "Testing GSF Manual"
+      <<all-tests>>
+      ))
 #+end_src
 
 * REPL play
 
 #+begin_src gerbil
-  (import :std/interactive)
+  (import :std/interactive )
 
   (reload :drewc/gsf/infile)
   (reload :drewc/gsf/input)
   (reload :drewc/gsf)
 
   (import :std/test :drewc/gsf)
-  (import :drewc/gsf/infile :drewc/gsf/input :drewc/gsf)
+  (import :drewc/gsf/infile :drewc/gsf/input :drewc/gsf :std/srfi/13)
 
 
 #+end_src
